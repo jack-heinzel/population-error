@@ -6,7 +6,7 @@ setuptools.setup(
     description='JAX-based package for estimating the information lost due to Monte Carlo approximations in GW population inference.',
     url='#',
     author='Jack Heinzel',
-    install_requires=['jax'],
+    install_requires=['jax', 'jax_tqdm'],
     author_email='heinzelj@mit.edu',
     packages=["population_error"],
     zip_safe=False
