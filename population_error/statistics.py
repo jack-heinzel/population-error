@@ -209,7 +209,7 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     
     return model_to_return
 
-def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), MC_type='single event'):
+def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), MC_type='single event', verbose=True):
     '''
     hyperposterior: pandas.dataframe
     model_function: bilby.hyper.model.Model or function
@@ -234,12 +234,18 @@ def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset
     keys = hyperposterior.keys()
     data = jnp.array([hyperposterior[k] for k in keys])
     
-    @jax_tqdm.loop_tqdm(n, print_rate=1, tqdm_type='std', desc=f'Computing {MC_type} covariance weights integrated over hyperposterior samples')
     def weights_for_single_sample(ii, mean_event_weights):
         parameters = {k: data[ik,ii] for ik, k in enumerate(keys)}
         weights = model_function(gw_dataset, parameters) / sampling_prior
         expectation = jnp.sum(weights, axis=-1) / MC_integral_size
         return mean_event_weights + weights / expectation[..., None] / n
+
+    if verbose:
+        f = jax_tqdm.loop_tqdm(n, print_rate=1, tqdm_type='std', desc=f'Computing {MC_type} covariance weights integrated over hyperposterior samples')
+    else:
+        f = jax.jit
+
+    weights_for_single_sample = f(weights_for_single_sample)
 
     mean_event_weights = jax.lax.fori_loop(
         0, 
@@ -247,9 +253,6 @@ def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset
         weights_for_single_sample, 
         mean_event_weights,
         )
-    # so there is no jax tracer leak
-    # if isinstance(bilby_model, bilby.hyper.model.Model) or isinstance(bilby_model, gwpopulation.experimental.jax.NonCachingModel):
-    #     bilby_model.parameters = {}
 
     return mean_event_weights
 
@@ -271,7 +274,17 @@ def _compute_integrated_cov(integrated_weights, sample, model_function, gw_datas
 
     return integrated_cov, var
     
-def error_statistics(model_function, injections, event_posteriors, hyperposterior, include_likelihood_correction=True, conversion_function=lambda args: (args, None), nobs=None):
+def error_statistics(
+        model_function, 
+        injections, 
+        event_posteriors, 
+        hyperposterior, 
+        include_likelihood_correction=True, 
+        conversion_function=lambda args: (args, None), 
+        nobs=None, 
+        verbose=True,
+        rate=False
+        ):
     '''
     model function is either a bilby.hyper.model.Model instance, 
     or a function which takes in f(dataset, hyperparameters) -> prob
@@ -284,8 +297,24 @@ def error_statistics(model_function, injections, event_posteriors, hyperposterio
         print(f'Nobs not provided, assuming Nobs = {nobs}')
     total_generated = injections['total_generated']
     
-    mean_event_weights = _compute_mean_weights_for_correction(hyperposterior, model_function, event_posteriors, conversion_function=conversion_function, MC_type='single event')
-    mean_vt_weights = _compute_mean_weights_for_correction(hyperposterior, model_function, injections, MC_integral_size=total_generated, conversion_function=conversion_function, MC_type='selection')
+    mean_event_weights = _compute_mean_weights_for_correction(
+        hyperposterior, 
+        model_function, 
+        event_posteriors, 
+        conversion_function=conversion_function, 
+        MC_type='single event', 
+        verbose=verbose
+        )
+    mean_vt_weights = _compute_mean_weights_for_correction(
+        hyperposterior, 
+        model_function, 
+        injections, 
+        MC_integral_size=total_generated, 
+        conversion_function=conversion_function, 
+        MC_type='selection', 
+        verbose=verbose,
+        rate=rate
+        )
     
     n = hyperposterior.shape[0]
 
@@ -301,7 +330,10 @@ def error_statistics(model_function, injections, event_posteriors, hyperposterio
                 _model_function, 
                 p,
                 ))
-        return jax_tqdm.scan_tqdm(n, print_rate=1, tqdm_type='std', desc=f'For each posterior sample, average {MC_type} covariance with another posterior sample')(loop_fn)
+        if verbose:
+            return jax_tqdm.scan_tqdm(n, print_rate=1, tqdm_type='std', desc=f'For each posterior sample, average {MC_type} covariance with another posterior sample')(loop_fn)
+        else:
+            return jax.jit(loop_fn)
 
     _, (_, event_integrated_covs, event_vars) = jax.lax.scan(
         create_loop_fn(mean_event_weights, event_posteriors),
@@ -327,4 +359,9 @@ def error_statistics(model_function, injections, event_posteriors, hyperposterio
     else:
         accuracy = float(jnp.var(cov) / 2 / jnp.log(2))
     error = float(precision + accuracy)
+    if verbose:
+        print(f'\nYour inference lost approximately {round(error, 3)} bits of information to Monte Carlo approximations. \nOf the total information loss \n - {round(precision,3)} bits was from uncertainty in the posterior \n - {round(accuracy,3)} bits was from bias in the posterior')
+    
+    # how much due to VT and how much due to events? We can also compute this :O I believe bc they are additive
+    
     return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
