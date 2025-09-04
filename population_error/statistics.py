@@ -187,9 +187,9 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
     weight_func = jax_tqdm.scan_tqdm(length, print_rate=1, tqdm_type='std')(weight_func)
     _, weights = jax.lax.scan(weight_func, 0., xs=axis)
 
-    precision = (jnp.mean(variances) - jnp.mean(weights)) / 2 / jnp.log(2)
-    accuracy = jnp.var(weights) / 2 / jnp.log(2)
-    error = precision + accuracy
+    precision = float((jnp.mean(variances) - jnp.mean(weights)) / 2 / jnp.log(2))
+    accuracy = float(jnp.var(weights) / 2 / jnp.log(2))
+    error = float(precision + accuracy)
     
     return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
 
