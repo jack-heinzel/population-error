@@ -194,7 +194,25 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
     return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
 
 def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: (args, None)):
-    
+    """
+    Wrap a Bilby or gwpopulation jax-compatible model into a callable function interface.
+
+    Parameters
+    ----------
+    bilby_model : bilby.hyper.model.Model, gwpopulation.experimental.jax.NonCachingModel, or callable
+        Model object to be converted. If it is already a callable, it is returned unchanged.
+    conversion_function : callable, optional
+        Function applied to parameter dictionaries before evaluating the model.
+        Should take a dict of parameters and return (modified_parameters, added_keys).
+
+    Returns
+    -------
+    callable
+        A function with signature (data, parameters) -> probability values,
+        where `data` is a dictionary of GW parameter samples and `parameters` are
+        hyperparameters of the population model.
+    """
+
     from copy import deepcopy
     model_copy = deepcopy(bilby_model)
     if not (isinstance(model_copy, bilby.hyper.model.Model) or isinstance(model_copy, gwpopulation.experimental.jax.NonCachingModel)):
@@ -210,13 +228,45 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     return model_to_return
 
 def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), MC_type='single event', verbose=True):
-    '''
-    hyperposterior: pandas.dataframe
-    model_function: bilby.hyper.model.Model or function
-    gw_dataset : dict
-    MC_integral_size : int or float
+    """
+    Compute mean event or selection weights integrated over hyperposterior samples. 
 
-    '''
+    For a Monte Carlo integral
+    
+    \hat{I}(\Lambda) = \frac{1}{M}\sum_{i=1}^M \frac{p(\theta_i | \Lambda)}{p(\theta_i | {\rm draw})},
+
+    and a set of $N_{\rm samp}$ samples from the hyperposterior $\Lambda_n$, then compute
+
+    \overline{w}_i = \frac{1}{N_{\rm samp}} \sum_{n=1}^{N_{\rm samp}} \frac{1}{\hat{I}(\Lambda_n)}\frac{p(\theta_i | \Lambda_n)}{p(\theta_i | {\rm draw})},
+
+    the weight averaged over the hyperposterior and dividing out $\hat{I}$, for use in computing the error statistics.
+
+    
+    Parameters
+    ----------
+    hyperposterior : pandas.DataFrame
+        Hyperposterior samples with columns as model parameter names.
+    bilby_model : bilby.hyper.model.Model, gwpopulation.experimental.jax.NonCachingModel, or callable
+        Population model used to compute probabilities.
+    gw_dataset : dict
+        Dictionary of GW data samples, must include 'prior' key for sampling prior.
+    MC_integral_size : int, optional
+        Number of Monte Carlo samples. If None, inferred from `gw_dataset` or prior shape.
+    conversion_function : callable, optional
+        Function to convert hyperposterior parameters before model evaluation. For example, 
+        gwpopulation.conversions.convert_to_beta_parameters
+    MC_type : str, default='single event'
+        Label for progress bar (e.g. 'single event' or 'selection').
+    verbose : bool, default=True
+        Whether to show a progress bar.
+
+    Returns
+    -------
+    jnp.ndarray
+        Mean normalized event weights across hyperposterior samples,
+        shape matching the sampling prior. 
+    """
+
     model_function = bilby_model_to_model_function(bilby_model, conversion_function=conversion_function)
 
     gw_dataset = gw_dataset.copy()
@@ -257,6 +307,28 @@ def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset
     return mean_event_weights
 
 def _compute_integrated_cov(integrated_weights, sample, model_function, gw_dataset, MC_integral_size=None):
+    """
+    Compute integrated covariance and variance for weights of a single posterior sample.
+
+    Parameters
+    ----------
+    integrated_weights : jnp.ndarray
+        Precomputed integrated weights across hyperposterior samples.
+    sample : dict
+        A single hyperposterior parameter sample.
+    model_function : callable
+        Function mapping (dataset, parameters) -> probability values.
+    gw_dataset : dict
+        Dataset dictionary with GW parameter samples, must include 'prior'.
+    MC_integral_size : int, optional
+        Number of Monte Carlo samples. If None, inferred from dataset.
+
+    Returns
+    -------
+    tuple of jnp.ndarray
+        - integrated_cov : Integrated covariance estimate for the sample.
+        - var : Variance estimate for the sample.
+    """
 
     gw_dataset = gw_dataset.copy()
     sampling_prior = gw_dataset.pop('prior')
@@ -269,7 +341,7 @@ def _compute_integrated_cov(integrated_weights, sample, model_function, gw_datas
 
     weights = model_function(gw_dataset, sample) / sampling_prior
     expectation = jnp.sum(weights, axis=-1) / MC_integral_size
-    var = (-1. + jnp.sum(weights**2, axis=-1) / MC_integral_size / expectation**2) / (MC_integral_size - 1) # double check implementation
+    var = (-1. + jnp.sum(weights**2, axis=-1) / MC_integral_size / expectation**2) / (MC_integral_size - 1)
     integrated_cov = (-1. + jnp.sum(integrated_weights * weights, axis=-1) / MC_integral_size / expectation) / (MC_integral_size - 1)
 
     return integrated_cov, var
@@ -285,12 +357,38 @@ def error_statistics(
         verbose=True,
         rate=False
         ):
-    '''
-    model function is either a bilby.hyper.model.Model instance, 
-    or a function which takes in f(dataset, hyperparameters) -> prob
-    where dataset is e.g., event posteriors or VT injection set
-    and is a dictionary of {GW_parameter: sample_array}
-    '''
+    """
+    Compute error, precision, and accuracy statistics from model, hyperposterior, and data.
+
+    Parameters
+    ----------
+    model_function : bilby.hyper.model.Model, callable
+        Population model with interface (dataset, parameters) -> probabilities.
+    injections : dict
+        Injection dataset, including 'prior' and 'total_generated' keys.
+    event_posteriors : dict
+        Event posterior samples, including 'prior' key.
+    hyperposterior : pandas.DataFrame
+        Hyperposterior samples with columns as parameter names.
+    include_likelihood_correction : bool, default=True
+        Whether to include likelihood correction in accuracy estimate.
+    conversion_function : callable, optional
+        Function to convert hyperposterior parameters before model evaluation.
+    nobs : int, optional
+        Number of observed events. If None, inferred from `event_posteriors`.
+    verbose : bool, default=True
+        Whether to print progress and summary messages.
+    rate : bool, default=False
+        Whether to treat the VT weights as rate-weighted.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'error_statistic' : float, total information loss in bits.
+        - 'precision_statistic' : float, information loss due to variance.
+        - 'accuracy_statistic' : float, information loss due to bias.
+    """
 
     if nobs is None:
         nobs = event_posteriors['prior'].shape[0]
@@ -362,6 +460,8 @@ def error_statistics(
     if verbose:
         print(f'\nYour inference lost approximately {round(error, 3)} bits of information to Monte Carlo approximations. \nOf the total information loss \n - {round(precision,3)} bits was from uncertainty in the posterior \n - {round(accuracy,3)} bits was from bias in the posterior')
     
-    # how much due to VT and how much due to events? We can also compute this :O I believe bc they are additive
+    # how much due to VT and how much due to events? We can also compute this :O I believe bc they are additive. Well, 
+    # I don't know if we can do it necessarily for the accuracy statistic, because Var(E + V) = Var(E) + 2Cov(E,V) + Var(V), so 
+    # we would technically have a "covariance" between event and vt terms. Still, could be interesting!
     
     return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
