@@ -472,7 +472,7 @@ def error_statistics(
     error = float(precision + accuracy)
     
     if verbose:
-        print(f'\nYour inference looses approximately {round(error, 3)} bits of information to Monte Carlo approximations.')
+        print(f'\nYour inference loses approximately {round(error, 3)} bits of information to Monte Carlo approximations.')
         print(f'Of the total information loss')
         print(f' * {round(precision, 3)} bits is from uncertainty in the posterior. Of this')
         print(f'    * {round(event_precision, 3)} bits is from the single-event Monte Carlo integration')
