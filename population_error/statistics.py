@@ -191,7 +191,7 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
     accuracy = jnp.var(weights) / 2 / jnp.log(2)
     error = precision + accuracy
     
-    return precision, accuracy, error 
+    return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
 
 def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: (args, None)):
     
@@ -320,10 +320,11 @@ def error_statistics(model_function, injections, event_posteriors, hyperposterio
     var = jnp.sum(event_vars, axis=-1) + nobs**2 * vt_vars
     cov = jnp.sum(event_integrated_covs, axis=-1) + nobs**2 * vt_integrated_covs
 
-    pi = (jnp.mean(var) - jnp.mean(cov)) / 2 / jnp.log(2)
+    precision = float((jnp.mean(var) - jnp.mean(cov)) / 2 / jnp.log(2))
     if include_likelihood_correction:
         correction = nobs*(nobs+1) * vt_vars / 2
-        ac = jnp.var(correction - cov) / 2 / jnp.log(2)
+        accuracy = float(jnp.var(correction - cov) / 2 / jnp.log(2))
     else:
-        ac = jnp.var(cov) / 2 / jnp.log(2)
-    return {'error_statistic': float(pi+ac), 'precision_statistic': float(pi), 'accuracy_statistic': float(ac)}
+        accuracy = float(jnp.var(cov) / 2 / jnp.log(2))
+    error = float(precision + accuracy)
+    return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
