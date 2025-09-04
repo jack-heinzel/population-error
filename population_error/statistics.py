@@ -227,7 +227,7 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     
     return model_to_return
 
-def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), MC_type='single event', verbose=True):
+def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), MC_type='single event', verbose=True, rate=False):
     """
     Compute mean event or selection weights integrated over hyperposterior samples. 
 
@@ -371,7 +371,9 @@ def error_statistics(
     hyperposterior : pandas.DataFrame
         Hyperposterior samples with columns as parameter names.
     include_likelihood_correction : bool, default=True
-        Whether to include likelihood correction in accuracy estimate.
+        Whether to include likelihood correction in accuracy estimate. 
+        Set to False if the hyperlikelihood for sampling from the posterior was estimated
+        using the unbiased likelihood of Eq. 24 of ----------------
     conversion_function : callable, optional
         Function to convert hyperposterior parameters before model evaluation.
     nobs : int, optional
@@ -379,7 +381,7 @@ def error_statistics(
     verbose : bool, default=True
         Whether to print progress and summary messages.
     rate : bool, default=False
-        Whether to treat the VT weights as rate-weighted.
+        Whether to treat the VT weights as rate-weighted. TODO!!!!
 
     Returns
     -------
@@ -392,7 +394,8 @@ def error_statistics(
 
     if nobs is None:
         nobs = event_posteriors['prior'].shape[0]
-        print(f'Nobs not provided, assuming Nobs = {nobs}')
+        if verbose:
+            print(f'Nobs not provided, assuming Nobs = {nobs}')
     total_generated = injections['total_generated']
     
     mean_event_weights = _compute_mean_weights_for_correction(
@@ -450,18 +453,46 @@ def error_statistics(
     var = jnp.sum(event_vars, axis=-1) + nobs**2 * vt_vars
     cov = jnp.sum(event_integrated_covs, axis=-1) + nobs**2 * vt_integrated_covs
 
+    event_precision = float(jnp.mean(jnp.sum(event_vars - event_integrated_covs, axis=-1)) / 2 / jnp.log(2))
+    vt_precision = float(nobs**2 * jnp.mean(vt_vars - vt_integrated_covs) / 2 / jnp.log(2))
+    
     precision = float((jnp.mean(var) - jnp.mean(cov)) / 2 / jnp.log(2))
     if include_likelihood_correction:
         correction = nobs*(nobs+1) * vt_vars / 2
-        accuracy = float(jnp.var(correction - cov) / 2 / jnp.log(2))
+        accuracy = float(jnp.var(cov - correction) / 2 / jnp.log(2))
+        selection_w = nobs**2 * vt_integrated_covs - correction
     else:
         accuracy = float(jnp.var(cov) / 2 / jnp.log(2))
+        selection_w = nobs**2 * vt_integrated_covs
+    event_w = jnp.sum(event_integrated_covs, axis=-1)
+    event_accuracy = float(jnp.var(event_w) / 2 / jnp.log(2))
+    selection_accuracy = float(jnp.var(selection_w) / 2 / jnp.log(2))
+    correlation_accuracy = float(jnp.mean((event_w - jnp.mean(event_w))*(selection_w - jnp.mean(selection_w))) / jnp.log(2))
+    
     error = float(precision + accuracy)
+    
     if verbose:
-        print(f'\nYour inference lost approximately {round(error, 3)} bits of information to Monte Carlo approximations. \nOf the total information loss \n - {round(precision,3)} bits was from uncertainty in the posterior \n - {round(accuracy,3)} bits was from bias in the posterior')
+        print(f'\nYour inference looses approximately {round(error, 3)} bits of information to Monte Carlo approximations.')
+        print(f'Of the total information loss')
+        print(f' * {round(precision, 3)} bits is from uncertainty in the posterior. Of this')
+        print(f'    * {round(event_precision, 3)} bits is from the single-event Monte Carlo integration')
+        print(f'    * {round(vt_precision, 3)} bits is from the selection Monte Carlo integration')
+        print(f' * {round(accuracy, 5)} bits is from bias in the posterior. Of the bias information loss')
+        print(f'    * {round(event_accuracy, 5)} bits is from the single-event Monte Carlo integration')
+        print(f'    * {round(selection_accuracy, 5)} bits is from the selection Monte Carlo integration')
+        print(f'    * {round(correlation_accuracy, 5)} bits is from correlations in the uncertainty of the single-event and selection MC integrals')
     
     # how much due to VT and how much due to events? We can also compute this :O I believe bc they are additive. Well, 
     # I don't know if we can do it necessarily for the accuracy statistic, because Var(E + V) = Var(E) + 2Cov(E,V) + Var(V), so 
-    # we would technically have a "covariance" between event and vt terms. Still, could be interesting!
+    # we would technically have a "covariance" between event and vt terms. Still, could be interesting at least to compute precision from VT and precision from events
     
-    return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
+    return {
+        'error_statistic': error, 
+        'precision_statistic': precision, 
+        'accuracy_statistic': accuracy,
+        'event_precision_statistic': event_precision,
+        'selection_precision_statistic': vt_precision,
+        'event_accuracy_statistic': event_accuracy,
+        'selection_accuracy_statistic': selection_accuracy,
+        'correlation_event_selection_accuracy_statistic': correlation_accuracy,
+        }
