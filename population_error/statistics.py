@@ -477,7 +477,7 @@ def error_statistics(
         print(f' * {round(precision, 3)} bits is from uncertainty in the posterior. Of this')
         print(f'    * {round(100*event_precision/precision, 1)}% is from the single-event Monte Carlo integration')
         print(f'    * {round(100*vt_precision/precision, 1)}% is from the selection Monte Carlo integration')
-        print(f' * {round(accuracy, 5)} bits is from bias in the posterior. Of the bias information loss')
+        print(f' * {round(accuracy, 5)} bits is from bias in the posterior. Of the total bias')
         print(f'    * {round(100*event_accuracy/accuracy, 1)}% is from the single-event Monte Carlo integration')
         print(f'    * {round(100*selection_accuracy/accuracy, 1)}% is from the selection Monte Carlo integration')
         print(f'    * {round(100*correlation_accuracy/accuracy, 1)}% is from correlations in the uncertainty of the single-event and selection MC integrals')
