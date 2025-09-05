@@ -475,12 +475,12 @@ def error_statistics(
         print(f'\nYour inference loses approximately {round(error, 3)} bits of information to Monte Carlo approximations.')
         print(f'Of the total information loss')
         print(f' * {round(precision, 3)} bits is from uncertainty in the posterior. Of this')
-        print(f'    * {round(event_precision, 3)} bits is from the single-event Monte Carlo integration')
-        print(f'    * {round(vt_precision, 3)} bits is from the selection Monte Carlo integration')
+        print(f'    * {round(100*event_precision/precision, 1)}% is from the single-event Monte Carlo integration')
+        print(f'    * {round(100*vt_precision/precision, 1)}% is from the selection Monte Carlo integration')
         print(f' * {round(accuracy, 5)} bits is from bias in the posterior. Of the bias information loss')
-        print(f'    * {round(event_accuracy, 5)} bits is from the single-event Monte Carlo integration')
-        print(f'    * {round(selection_accuracy, 5)} bits is from the selection Monte Carlo integration')
-        print(f'    * {round(correlation_accuracy, 5)} bits is from correlations in the uncertainty of the single-event and selection MC integrals')
+        print(f'    * {round(100*event_accuracy/accuracy, 1)}% is from the single-event Monte Carlo integration')
+        print(f'    * {round(100*selection_accuracy/accuracy, 1)}% is from the selection Monte Carlo integration')
+        print(f'    * {round(100*correlation_accuracy/accuracy, 1)}% is from correlations in the uncertainty of the single-event and selection MC integrals')
     
     # how much due to VT and how much due to events? We can also compute this :O I believe bc they are additive. Well, 
     # I don't know if we can do it necessarily for the accuracy statistic, because Var(E + V) = Var(E) + 2Cov(E,V) + Var(V), so 
