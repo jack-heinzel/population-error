@@ -7,7 +7,7 @@ setuptools.setup(
     url='https://github.com/jack-heinzel/population-error',
     project_urls={
         'Source': 'https://github.com/jack-heinzel/population-error',
-        'Documentation': '',
+        'Documentation': 'https://population-error.readthedocs.io/',
     },
     author='Jack Heinzel',
     install_requires=['jax', 'jax_tqdm', 'gwpopulation', 'bilby'],
