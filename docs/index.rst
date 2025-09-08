@@ -17,7 +17,7 @@ Autodoc API Reference
 
 This section documents the Python API automatically from your docstrings.
 
-.. automodule:: your_package_name
+.. automodule:: population-error
    :members:
    :undoc-members:
    :show-inheritance:
