@@ -23,7 +23,7 @@ Examples
 API Reference
 -------------
 
-.. automodule:: population_error
+.. automodule:: population_error.statistics
    :members:
    :undoc-members:
    :show-inheritance:
