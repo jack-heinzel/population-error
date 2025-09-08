@@ -3,31 +3,27 @@ population-error Documentation
 
 Welcome to the documentation for **population-error**.
 
-Contents:
+Contents
 --------
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
-   
+
    modules
 
-   :caption: Examples:
+Examples
+--------
+
+.. toctree::
+   :maxdepth: 2
 
    examples/gwpopulation.ipynb
    examples/weights_array.ipynb
 
-Examples:
----------
+API Reference
+-------------
 
-
-
-API:
-----
-
-.. automodule:: population-error
+.. automodule:: population_error
    :members:
    :undoc-members:
    :show-inheritance:
-
-
