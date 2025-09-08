@@ -23,6 +23,7 @@ extensions = [
     "sphinx.ext.napoleon",      # Support Google/NumPy style docstrings
     "sphinx.ext.viewcode",      # Add links to highlighted source code
     "sphinx.ext.githubpages",   # Create .nojekyll file for GitHub Pages
+    "nbsphinx",
 ]
 
 templates_path = ["_templates"]

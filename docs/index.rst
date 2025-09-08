@@ -1,21 +1,29 @@
-YourProjectName Documentation
+population-error Documentation
 =============================
 
 Welcome to the documentation for **population-error**.
 
-Contents
+Contents:
 --------
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
-
+   
    modules
 
-Autodoc API Reference
---------------------
+   :caption: Examples:
 
-This section documents the Python API automatically from your docstrings.
+   examples/gwpopulation.ipynb
+   examples/weights_array.ipynb
+
+Examples:
+---------
+
+
+
+API:
+----
 
 .. automodule:: population-error
    :members:
