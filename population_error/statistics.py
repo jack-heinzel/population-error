@@ -193,9 +193,13 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
     
     return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
 
-def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: (args, None)):
+def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: (args, None), rate=False, rate_key='rate'):
     """
     Wrap a Bilby or gwpopulation jax-compatible model into a callable function interface.
+
+    Note: if using the rate-full likelihood, this model should return dN/d\theta. It should
+    *not* be in comoving rate density in units Gpc^{-3} yr^{-1}. Instead, it is expected to be in 
+    a density in redshift.
 
     Parameters
     ----------
@@ -204,6 +208,13 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     conversion_function : callable, optional
         Function applied to parameter dictionaries before evaluating the model.
         Should take a dict of parameters and return (modified_parameters, added_keys).
+    rate : bool, default=False
+        Whether to be used with the rate-full hierarchical likelihood.
+    rate_key : string, default='rate'
+        The key to recognize as N, where N is the total number of mergers in the Universe during the
+        observing time, e.g., dN/d\theta = Np(\theta | \Lambda). This is only used if rate=True and 
+        using bilby_model as bilby.hyper.model.Model or gwpopulation.experimental.jax.NonCachingModel, 
+        as these only return probability densities.
 
     Returns
     -------
@@ -221,13 +232,17 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     
 
     def model_to_return(data, parameters):
+        R = parameters.pop(rate_key, 1.)
         parameters, added_keys = conversion_function(parameters)
         model_copy.parameters.update(parameters)
-        return model_copy.prob(data)
+        return R*model_copy.prob(data)
     
     return model_to_return
 
-def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), MC_type='single event', verbose=True, rate=False):
+def _compute_mean_weights_for_correction(
+        hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), 
+        MC_type='single event', verbose=True, rate=False, rate_key='rate'
+        ):
     """
     Compute mean event or selection weights integrated over hyperposterior samples. 
 
@@ -259,6 +274,15 @@ def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset
         Label for progress bar (e.g. 'single event' or 'selection').
     verbose : bool, default=True
         Whether to show a progress bar.
+    rate: bool, default=False
+        Whether to compute the integrated weight *without* dividing by the MC integral. For use with 
+        the rate-full likelihood. If setting rate=True, then the bilby_model must return dN/d\theta. It 
+        should *not* be in units of comoving merger rate density. 
+    rate_key : string, default='rate'
+        The key to recognize as N, where N is the total number of mergers in the Universe during the
+        observing time, e.g., dN/d\theta = Np(\theta | \Lambda). This is only used if rate=True and 
+        using bilby_model as bilby.hyper.model.Model or gwpopulation.experimental.jax.NonCachingModel, 
+        as these only return probability densities.
 
     Returns
     -------
@@ -267,7 +291,7 @@ def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset
         shape matching the sampling prior. 
     """
 
-    model_function = bilby_model_to_model_function(bilby_model, conversion_function=conversion_function)
+    model_function = bilby_model_to_model_function(bilby_model, conversion_function=conversion_function, rate=rate, rate_key=rate_key)
 
     gw_dataset = gw_dataset.copy()
     sampling_prior = gw_dataset.pop('prior')
@@ -287,7 +311,11 @@ def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset
     def weights_for_single_sample(ii, mean_event_weights):
         parameters = {k: data[ik,ii] for ik, k in enumerate(keys)}
         weights = model_function(gw_dataset, parameters) / sampling_prior
-        expectation = jnp.sum(weights, axis=-1) / MC_integral_size
+        if rate:
+            expectation = jnp.ones(weights.shape[:-1])
+        else:
+            expectation = jnp.sum(weights, axis=-1) / MC_integral_size
+            
         return mean_event_weights + weights / expectation[..., None] / n
 
     if verbose:
@@ -306,7 +334,7 @@ def _compute_mean_weights_for_correction(hyperposterior, bilby_model, gw_dataset
 
     return mean_event_weights
 
-def _compute_integrated_cov(integrated_weights, sample, model_function, gw_dataset, MC_integral_size=None):
+def _compute_integrated_cov(integrated_weights, sample, model_function, gw_dataset, MC_integral_size=None, rate=False):
     """
     Compute integrated covariance and variance for weights of a single posterior sample.
 
@@ -322,6 +350,10 @@ def _compute_integrated_cov(integrated_weights, sample, model_function, gw_datas
         Dataset dictionary with GW parameter samples, must include 'prior'.
     MC_integral_size : int, optional
         Number of Monte Carlo samples. If None, inferred from dataset.
+    rate : bool, default=True
+        Whether to assume rate-full likelihood. If True, then the weights are assumed to include the overall 
+        rate normalization, N, where dN/d\theta = Np(\theta | \Lambda). It should only be set to True when
+        computing the integrated covariance for the selection efficiency integral.
 
     Returns
     -------
@@ -340,7 +372,12 @@ def _compute_integrated_cov(integrated_weights, sample, model_function, gw_datas
             MC_integral_size = sampling_prior.shape[-1]
 
     weights = model_function(gw_dataset, sample) / sampling_prior
-    expectation = jnp.sum(weights, axis=-1) / MC_integral_size
+
+    if rate:
+        expectation = jnp.ones(weights.shape[:-1])
+    else:
+        expectation = jnp.sum(weights, axis=-1) / MC_integral_size
+
     var = (-1. + jnp.sum(weights**2, axis=-1) / MC_integral_size / expectation**2) / (MC_integral_size - 1)
     integrated_cov = (-1. + jnp.sum(integrated_weights * weights, axis=-1) / MC_integral_size / expectation) / (MC_integral_size - 1)
 
@@ -355,7 +392,8 @@ def error_statistics(
         conversion_function=lambda args: (args, None), 
         nobs=None, 
         verbose=True,
-        rate=False
+        rate=False,
+        rate_key='rate',
         ):
     """
     Compute error, precision, and accuracy statistics from model, hyperposterior, and data.
@@ -381,7 +419,9 @@ def error_statistics(
     verbose : bool, default=True
         Whether to print progress and summary messages.
     rate : bool, default=False
-        Whether to treat the VT weights as rate-weighted. TODO!!!!
+        Whether to treat the VT weights as rate-weighted. TESTTHIS!!!
+    rate_key : string, default='rate'
+        The key which to access the overall merger rate within the posterior.
 
     Returns
     -------
@@ -414,7 +454,8 @@ def error_statistics(
         conversion_function=conversion_function, 
         MC_type='selection', 
         verbose=verbose,
-        rate=rate
+        rate=rate,
+        rate_key=rate_key
         )
     
     n = hyperposterior.shape[0]
@@ -425,11 +466,17 @@ def error_statistics(
 
     def create_loop_fn(m, p, MC_type='single event'):
         _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function)
+        if MC_type=='single event':
+            _rate = False
+        else:
+            _rate = rate
         loop_fn = lambda _, sample: (_, (sample[0],)+ _compute_integrated_cov(
                 m,
                 sample[1], 
                 _model_function, 
                 p,
+                rate=_rate,
+                rate_key=rate_key
                 ))
         if verbose:
             return jax_tqdm.scan_tqdm(n, print_rate=1, tqdm_type='std', desc=f'For each posterior sample, average {MC_type} covariance with another posterior sample')(loop_fn)
@@ -450,6 +497,8 @@ def error_statistics(
         length=n
     )
 
+    if rate:
+        nobs = 1
     var = jnp.sum(event_vars, axis=-1) + nobs**2 * vt_vars
     cov = jnp.sum(event_integrated_covs, axis=-1) + nobs**2 * vt_integrated_covs
 
@@ -458,7 +507,10 @@ def error_statistics(
     
     precision = float((jnp.mean(var) - jnp.mean(cov)) / 2 / jnp.log(2))
     if include_likelihood_correction:
-        correction = nobs*(nobs+1) * vt_vars / 2
+        if rate:
+            correction = vt_vars / 2
+        else:
+            correction = nobs*(nobs+1) * vt_vars / 2
         accuracy = float(jnp.var(cov - correction) / 2 / jnp.log(2))
         selection_w = nobs**2 * vt_integrated_covs - correction
     else:
