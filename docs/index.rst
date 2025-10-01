@@ -1,7 +1,7 @@
 population-error
 ================
 
-Welcome to the documentation for **population-error**, a `JAX` based python package for calculating the information loss due to Monte Carlo approximations in hierarchical inference. This package is intended for use with gravitational-wave population analyses, and is designed to interface with [`gwpopulation`](https://colmtalbot.github.io/gwpopulation/guide/index.html)
+Welcome to the documentation for **population-error**, a `JAX` based python package for calculating the information loss due to Monte Carlo approximations in hierarchical inference. This package is intended for use with gravitational-wave population analyses. It is designed to interface easily with `gwpopulation <https://colmtalbot.github.io/gwpopulation/guide/index.html>`_, but is designed to be lightweight and flexible enough to interface with any general population analysis scheme.
 
 Contents
 --------
