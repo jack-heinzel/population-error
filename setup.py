@@ -3,6 +3,7 @@ import setuptools
 setuptools.setup(
     name='population-error',
     version='0.1',
+    include_package_data=False,
     description='JAX-based package for estimating the information lost due to Monte Carlo approximations in GW population inference.',
     url='https://github.com/jack-heinzel/population-error',
     project_urls={
