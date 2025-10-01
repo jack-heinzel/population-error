@@ -167,8 +167,7 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
         - error : float
             Expected information lost to both bias and uncertainty in posterior estimator.
     """
-    
-    # compute weights according to Eq. 39
+
     length, Nobs, NPE = event_weights.shape
     axis = jnp.arange(length)
     arr_n, arr_m = jnp.meshgrid(axis, axis, indexing='ij')
@@ -232,7 +231,11 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     
 
     def model_to_return(data, parameters):
-        R = parameters.pop(rate_key, 1.)
+        if rate:
+            R = parameters.pop(rate_key)
+        else:
+            R = 1.
+
         parameters, added_keys = conversion_function(parameters)
         model_copy.parameters.update(parameters)
         return R*model_copy.prob(data)
@@ -411,7 +414,7 @@ def error_statistics(
     include_likelihood_correction : bool, default=True
         Whether to include likelihood correction in accuracy estimate. 
         Set to False if the hyperlikelihood for sampling from the posterior was estimated
-        using the unbiased likelihood of Eq. 24 of ----------------
+        using the unbiased likelihood of Eq. 24 of https://arxiv.org/abs/2509.07221
     conversion_function : callable, optional
         Function to convert hyperposterior parameters before model evaluation.
     nobs : int, optional
@@ -465,18 +468,18 @@ def error_statistics(
         hyperposterior_samples[k] = jnp.array(hyperposterior_samples[k])
 
     def create_loop_fn(m, p, MC_type='single event'):
-        _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function)
         if MC_type=='single event':
             _rate = False
         else:
             _rate = rate
+        _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
+
         loop_fn = lambda _, sample: (_, (sample[0],)+ _compute_integrated_cov(
                 m,
                 sample[1], 
                 _model_function, 
                 p,
-                rate=_rate,
-                rate_key=rate_key
+                rate=_rate
                 ))
         if verbose:
             return jax_tqdm.scan_tqdm(n, print_rate=1, tqdm_type='std', desc=f'For each posterior sample, average {MC_type} covariance with another posterior sample')(loop_fn)
