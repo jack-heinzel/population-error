@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setuptools.setup(
     name='population-error',
-    version='0.1',
+    version='0.1.2',
     include_package_data=False,
     description='JAX-based package for estimating the information lost due to Monte Carlo approximations in GW population inference.',
     long_description=long_description,
