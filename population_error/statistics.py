@@ -223,13 +223,10 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
         hyperparameters of the population model.
     """
 
-    from copy import deepcopy
-    model_copy = deepcopy(bilby_model)
-    if not (isinstance(model_copy, bilby.hyper.model.Model) or isinstance(model_copy, gwpopulation.experimental.jax.NonCachingModel)):
+    if not (isinstance(bilby_model, bilby.hyper.model.Model) or isinstance(bilby_model, gwpopulation.experimental.jax.NonCachingModel)):
         # TODO: add some catches here, otherwise it assumes a particular form for the model
-        return model_copy # function of data, parameters
+        return bilby_model # function of data, parameters
     
-
     def model_to_return(data, parameters):
         if rate:
             R = parameters.pop(rate_key)
@@ -237,8 +234,8 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
             R = 1.
 
         parameters, added_keys = conversion_function(parameters)
-        model_copy.parameters.update(parameters)
-        return R*model_copy.prob(data)
+        bilby_model.parameters.update(parameters)
+        return R*bilby_model.prob(data)
     
     return model_to_return
 
