@@ -226,6 +226,10 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
         # TODO: add some catches here, otherwise it assumes a particular form for the model
         return bilby_model # function of data, parameters
 
+    from copy import copy
+    copy_models = [copy(m) for m in bilby_model.models]
+    bilby_model = bilby.hyper.model.Model(copy_models, cache=False)
+    
     def model_to_return(data, parameters):
         if rate:
             R = parameters.pop(rate_key)
