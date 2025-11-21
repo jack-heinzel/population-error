@@ -141,7 +141,7 @@ def log_likelihood_covariance(vt_weights_n, vt_weights_m, event_pe_weights_n, ev
 
 def error_statistics_from_weights(vt_weights, event_weights, total_generated, include_likelihood_correction=True):
     """
-    Compute error statistics for hyperposterior, Eqs. 36-39 of ---------------
+    Compute error statistics for hyperposterior, Eqs. 36-39 of arxiv:2509.07221
 
     Parameters
     ----------
@@ -202,8 +202,8 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
 
     Parameters
     ----------
-    bilby_model : bilby.hyper.model.Model, gwpopulation.experimental.jax.NonCachingModel, or callable
-        Model object to be converted. If it is already a callable, it is returned unchanged.
+    bilby_model : bilby.hyper.model.Model or callable Model object to be converted. If it is already 
+        a callable, it is returned unchanged.
     conversion_function : callable, optional
         Function applied to parameter dictionaries before evaluating the model.
         Should take a dict of parameters and return (modified_parameters, added_keys).
@@ -212,8 +212,7 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     rate_key : string, default='rate'
         The key to recognize as N, where N is the total number of mergers in the Universe during the
         observing time, e.g., dN/d\theta = Np(\theta | \Lambda). This is only used if rate=True and 
-        using bilby_model as bilby.hyper.model.Model or gwpopulation.experimental.jax.NonCachingModel, 
-        as these only return probability densities.
+        using bilby_model as bilby.hyper.model.Model, as this only returns probability densities.
 
     Returns
     -------
@@ -223,10 +222,10 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
         hyperparameters of the population model.
     """
 
-    if not (isinstance(bilby_model, bilby.hyper.model.Model) or isinstance(bilby_model, gwpopulation.experimental.jax.NonCachingModel)):
+    if not isinstance(bilby_model, (bilby.hyper.model.Model, gwpopulation.experimental.jax.NonCachingModel)):
         # TODO: add some catches here, otherwise it assumes a particular form for the model
         return bilby_model # function of data, parameters
-    
+
     def model_to_return(data, parameters):
         if rate:
             R = parameters.pop(rate_key)
@@ -261,7 +260,7 @@ def _compute_mean_weights_for_correction(
     ----------
     hyperposterior : pandas.DataFrame
         Hyperposterior samples with columns as model parameter names.
-    bilby_model : bilby.hyper.model.Model, gwpopulation.experimental.jax.NonCachingModel, or callable
+    bilby_model : bilby.hyper.model.Model, or callable
         Population model used to compute probabilities.
     gw_dataset : dict
         Dictionary of GW data samples, must include 'prior' key for sampling prior.
@@ -281,8 +280,7 @@ def _compute_mean_weights_for_correction(
     rate_key : string, default='rate'
         The key to recognize as N, where N is the total number of mergers in the Universe during the
         observing time, e.g., dN/d\theta = Np(\theta | \Lambda). This is only used if rate=True and 
-        using bilby_model as bilby.hyper.model.Model or gwpopulation.experimental.jax.NonCachingModel, 
-        as these only return probability densities.
+        using bilby_model as bilby.hyper.model.Model, as this only returns probability densities.
 
     Returns
     -------
@@ -388,6 +386,7 @@ def error_statistics(
         injections, 
         event_posteriors, 
         hyperposterior, 
+        vt_model_function=None,
         include_likelihood_correction=True, 
         conversion_function=lambda args: (args, None), 
         nobs=None, 
@@ -408,6 +407,10 @@ def error_statistics(
         Event posterior samples, including 'prior' key.
     hyperposterior : pandas.DataFrame
         Hyperposterior samples with columns as parameter names.
+    vt_model_function : bilby.hyper.model.Model, callable, optional
+        Optional separate model instance for evaluating the selection function. 
+        Population model with interface (dataset, parameters) -> probabilities. If not 
+        included, set to model_function
     include_likelihood_correction : bool, default=True
         Whether to include likelihood correction in accuracy estimate. 
         Set to False if the hyperlikelihood for sampling from the posterior was estimated
@@ -446,9 +449,11 @@ def error_statistics(
         MC_type='single event', 
         verbose=verbose
         )
+    if vt_model_function is None:
+        vt_model_function = model_function
     mean_vt_weights = _compute_mean_weights_for_correction(
         hyperposterior, 
-        model_function, 
+        vt_model_function, 
         injections, 
         MC_integral_size=total_generated, 
         conversion_function=conversion_function, 
@@ -467,10 +472,10 @@ def error_statistics(
     def create_loop_fn(m, p, MC_type='single event'):
         if MC_type=='single event':
             _rate = False
+            _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
         else:
             _rate = rate
-        _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
-
+            _model_function = bilby_model_to_model_function(vt_model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
         loop_fn = lambda _, sample: (_, (sample[0],)+ _compute_integrated_cov(
                 m,
                 sample[1], 
