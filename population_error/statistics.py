@@ -3,6 +3,7 @@ import jax
 import jax_tqdm
 import bilby
 import gwpopulation
+import pandas as pd
 
 def selection_function(weights, total_generated):
     """
@@ -243,7 +244,7 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
     return model_to_return
 
 def _compute_mean_weights_for_correction(
-        hyperposterior, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), 
+        hyperposterior, n, bilby_model, gw_dataset, MC_integral_size=None, conversion_function=lambda args: (args, None), 
         MC_type='single event', verbose=True, rate=False, rate_key='rate'
         ):
     """
@@ -262,8 +263,11 @@ def _compute_mean_weights_for_correction(
     
     Parameters
     ----------
-    hyperposterior : pandas.DataFrame
-        Hyperposterior samples with columns as model parameter names.
+    hyperposterior : dict of jnp.ndarray
+        Hyperposterior samples with keys as hyperparameters, and values are jnp.ndarray 
+        with first dimension indexing the hyperposterior sample
+    n : int
+        Number of samples in the hyperposterior
     bilby_model : bilby.hyper.model.Model, or callable
         Population model used to compute probabilities.
     gw_dataset : dict
@@ -306,12 +310,10 @@ def _compute_mean_weights_for_correction(
 
     mean_event_weights = jnp.zeros_like(sampling_prior) # (Nevents, NPE)
     
-    n = hyperposterior.shape[0]
     keys = hyperposterior.keys()
-    data = jnp.array([hyperposterior[k] for k in keys])
     
     def weights_for_single_sample(ii, mean_event_weights):
-        parameters = {k: data[ik,ii] for ik, k in enumerate(keys)}
+        parameters = {k: hyperposterior[k][ii] for k in keys}
         weights = model_function(gw_dataset, parameters) / sampling_prior
         if rate:
             expectation = jnp.ones(weights.shape[:-1])
@@ -385,6 +387,25 @@ def _compute_integrated_cov(integrated_weights, sample, model_function, gw_datas
 
     return integrated_cov, var
     
+
+def format_hyperposterior(hyperposterior):
+    if isinstance(hyperposterior, pd.DataFrame):
+        hyperposterior = hyperposterior.to_dict(orient='list')
+    else:
+        if not isinstance(hyperposterior, dict):
+            raise IOError(f"Hyperposterior must be a dictionary or pandas.DataFrame, not {type(hyperposterior)}")
+
+    ns = []
+    for k in hyperposterior.keys():
+        hyperposterior[k] = jnp.array(hyperposterior[k])
+        ns.append(hyperposterior.shape[0])
+
+    if not jnp.all(jnp.array(ns) == ns[0]):
+        raise IOError(f"Hyperposterior has unequal number of samples for hyperparameters.")
+
+    n = ns[0]
+    return hyperposterior, n
+
 def error_statistics(
         model_function, 
         injections, 
@@ -409,8 +430,10 @@ def error_statistics(
         Injection dataset, including 'prior' and 'total_generated' keys.
     event_posteriors : dict
         Event posterior samples, including 'prior' key.
-    hyperposterior : pandas.DataFrame
-        Hyperposterior samples with columns as parameter names.
+    hyperposterior : pandas.DataFrame or dict of jnp.ndarray
+        If pandas.DataFrame, converts to appropriate format. Otherwise, hyperposterior 
+        samples with keys as hyperparameters, and values are jnp.ndarray with first 
+        dimension indexing the hyperposterior sample
     vt_model_function : bilby.hyper.model.Model, callable, optional
         Optional separate model instance for evaluating the selection function. 
         Population model with interface (dataset, parameters) -> probabilities. If not 
@@ -439,6 +462,8 @@ def error_statistics(
         - 'accuracy_statistic' : float, information loss due to bias.
     """
 
+    hyperposterior, n = format_hyperposterior(hyperposterior)
+
     if nobs is None:
         nobs = event_posteriors['prior'].shape[0]
         if verbose:
@@ -466,12 +491,6 @@ def error_statistics(
         rate=rate,
         rate_key=rate_key
         )
-    
-    n = hyperposterior.shape[0]
-
-    hyperposterior_samples = hyperposterior.to_dict(orient='list')
-    for k in hyperposterior_samples.keys():
-        hyperposterior_samples[k] = jnp.array(hyperposterior_samples[k])
 
     def create_loop_fn(m, p, MC_type='single event'):
         if MC_type=='single event':
@@ -495,14 +514,14 @@ def error_statistics(
     _, (_, event_integrated_covs, event_vars) = jax.lax.scan(
         create_loop_fn(mean_event_weights, event_posteriors),
         0,
-        (jnp.arange(n), hyperposterior_samples),
+        (jnp.arange(n), hyperposterior),
         length=n
     )
     
     _, (_, vt_integrated_covs, vt_vars) = jax.lax.scan(
         create_loop_fn(mean_vt_weights, injections, MC_type='selection'),
         0,
-        (jnp.arange(n), hyperposterior_samples),
+        (jnp.arange(n), hyperposterior),
         length=n
     )
 
