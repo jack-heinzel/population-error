@@ -31,6 +31,7 @@ dependencies = [
 packages = ["population_error"]
 zip-safe = false
 include-package-data = false
+license-files = []
 
 [tool.setuptools_scm]
 version_scheme = "release-branch-semver"
