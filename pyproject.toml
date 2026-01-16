@@ -7,7 +7,12 @@ name = "population-error"
 description = "JAX-based package for estimating the information lost due to Monte Carlo approximations in GW population inference."
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
 authors = [
     {name = "Jack Heinzel", email = "heinzelj@mit.edu"}
 ]
