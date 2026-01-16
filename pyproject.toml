@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools_scm[toml]>=3.4.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "population-error"
+description = "JAX-based package for estimating the information lost due to Monte Carlo approximations in GW population inference."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Jack Heinzel", email = "heinzelj@mit.edu"}
+]
+urls = {Source = "https://github.com/jack-heinzel/population-error", Documentation = "https://population-error.readthedocs.io/"}
+
+dynamic = ["version"]
+
+dependencies = [
+    "jax",
+    "jax_tqdm",
+    "gwpopulation",
+    "bilby",
+]
+
+[tool.setuptools]
+packages = ["population_error"]
+zip-safe = false
+include-package-data = false
+
+[tool.setuptools_scm]
+version_scheme = "release-branch-semver"
+write_to = "population_error/_version.py"
