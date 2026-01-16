@@ -398,7 +398,7 @@ def format_hyperposterior(hyperposterior):
     ns = []
     for k in hyperposterior.keys():
         hyperposterior[k] = jnp.array(hyperposterior[k])
-        ns.append(hyperposterior.shape[0])
+        ns.append(hyperposterior[k].shape[0])
 
     if not jnp.all(jnp.array(ns) == ns[0]):
         raise IOError(f"Hyperposterior has unequal number of samples for hyperparameters.")
@@ -472,6 +472,7 @@ def error_statistics(
     
     mean_event_weights = _compute_mean_weights_for_correction(
         hyperposterior, 
+        n,
         model_function, 
         event_posteriors, 
         conversion_function=conversion_function, 
@@ -482,6 +483,7 @@ def error_statistics(
         vt_model_function = model_function
     mean_vt_weights = _compute_mean_weights_for_correction(
         hyperposterior, 
+        n,
         vt_model_function, 
         injections, 
         MC_integral_size=total_generated, 
