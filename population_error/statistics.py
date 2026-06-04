@@ -223,7 +223,14 @@ def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: 
         hyperparameters of the population model.
     """
 
-    if not isinstance(bilby_model, (bilby.hyper.model.Model, gwpopulation.experimental.jax.NonCachingModel)):
+    try:
+        from gwpopulation.experimental.jax import NonCachingModel
+    except ImportError:
+        NonCachingModel = None
+    valid_types = (bilby.hyper.model.Model,)
+    if NonCachingModel is not None:
+        valid_types = valid_types + (NonCachingModel,)
+    if not isinstance(bilby_model, valid_types):
         # TODO: add some catches here, otherwise it assumes a particular form for the model
         return bilby_model # function of data, parameters
 
