@@ -67,7 +67,7 @@ def likelihood_log_correction(weights, total_generated, Nobs):
     var = selection_function_log_covariance(weights, weights, total_generated)
     return Nobs * (Nobs+1) * var / 2
 
-def reweighted_event_bayes_factors(event_pe_weights):
+def reweighted_event_bayes_factors(event_pe_weights, counts=None):
     """
     Compute reweighted Bayes factors for a set of events.
 
@@ -75,16 +75,22 @@ def reweighted_event_bayes_factors(event_pe_weights):
     ----------
     event_pe_weights : jnp.ndarray
         Array of shape (Nobs, NPE) with posterior sample weights per event.
+    counts : jnp.ndarray, optional
+        Per-event real sample counts, shape (Nobs,). Provide when ``event_pe_weights``
+        is zero-padded (ragged) so the per-event mean divides by the true count rather
+        than ``NPE``. If ``None``, a plain mean over axis 1 is used.
 
     Returns
     -------
     jnp.ndarray
         Array of mean Bayes factors per event, shape (Nobs,).
     """
-    
-    return jnp.mean(event_pe_weights, axis=1)
 
-def event_log_covariances(event_pe_weights_n, event_pe_weights_m):
+    if counts is None:
+        return jnp.mean(event_pe_weights, axis=1)
+    return jnp.sum(event_pe_weights, axis=1) / counts
+
+def event_log_covariances(event_pe_weights_n, event_pe_weights_m, counts=None):
     """
     Compute covariances of log Bayes factors between two sets of event weights.
 
@@ -94,6 +100,9 @@ def event_log_covariances(event_pe_weights_n, event_pe_weights_m):
         First array of event posterior sample weights, shape (Nobs, NPE).
     event_pe_weights_m : jnp.ndarray
         Second array of event posterior sample weights (same shape as above).
+    counts : jnp.ndarray, optional
+        Per-event real sample counts, shape (Nobs,), for zero-padded (ragged) weights.
+        If ``None``, the common ``NPE`` is used for all events.
 
     Returns
     -------
@@ -104,13 +113,16 @@ def event_log_covariances(event_pe_weights_n, event_pe_weights_m):
     assert event_pe_weights_m.shape == event_pe_weights_n.shape
     Nobs, NPE = event_pe_weights_n.shape
 
-    mu_n = reweighted_event_bayes_factors(event_pe_weights_n)
-    mu_m = reweighted_event_bayes_factors(event_pe_weights_m)
+    mu_n = reweighted_event_bayes_factors(event_pe_weights_n, counts=counts)
+    mu_m = reweighted_event_bayes_factors(event_pe_weights_m, counts=counts)
 
-    cov = jnp.mean(event_pe_weights_n*event_pe_weights_m, axis=1) / mu_n / mu_m - 1
-    return cov / (NPE - 1)
+    if counts is None:
+        cov = jnp.mean(event_pe_weights_n*event_pe_weights_m, axis=1) / mu_n / mu_m - 1
+        return cov / (NPE - 1)
+    cov = (jnp.sum(event_pe_weights_n*event_pe_weights_m, axis=1) / counts) / mu_n / mu_m - 1
+    return cov / (counts - 1)
 
-def log_likelihood_covariance(vt_weights_n, vt_weights_m, event_pe_weights_n, event_pe_weights_m, total_generated):
+def log_likelihood_covariance(vt_weights_n, vt_weights_m, event_pe_weights_n, event_pe_weights_m, total_generated, event_counts=None):
     """
     Compute covariance of log-likelihood estimates from injection and event weights.
 
@@ -135,12 +147,12 @@ def log_likelihood_covariance(vt_weights_n, vt_weights_m, event_pe_weights_n, ev
 
     Nobs, NPE = event_pe_weights_n.shape
 
-    event_covs = event_log_covariances(event_pe_weights_n, event_pe_weights_m)
+    event_covs = event_log_covariances(event_pe_weights_n, event_pe_weights_m, counts=event_counts)
     vt_cov = selection_function_log_covariance(vt_weights_n, vt_weights_m, total_generated)
 
     return jnp.sum(event_covs) + Nobs**2 * vt_cov
 
-def error_statistics_from_weights(vt_weights, event_weights, total_generated, include_likelihood_correction=True):
+def error_statistics_from_weights(vt_weights, event_weights, total_generated, include_likelihood_correction=True, event_counts=None):
     """
     Compute error statistics for hyperposterior, Eqs. 36-39 of arxiv:2509.07221
 
@@ -156,6 +168,10 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
         Whether to include the likelihood correction term in the accuracy statistic. Set to True if
         inference did not include the likelihood correction term, set to False if inference did
         include the likelihood correction.
+    event_counts : jnp.ndarray, optional
+        Per-event real sample counts, shape (n_obs,), when ``event_weights`` is
+        zero-padded (ragged). Padded entries must be 0 (e.g. from a +inf sampling
+        prior). If ``None``, all events are assumed to have the common ``n_pe``.
 
     Returns
     -------
@@ -172,7 +188,7 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
     length, Nobs, NPE = event_weights.shape
     axis = jnp.arange(length)
     arr_n, arr_m = jnp.meshgrid(axis, axis, indexing='ij')
-    f = lambda n, m: log_likelihood_covariance(vt_weights[n], vt_weights[m], event_weights[n], event_weights[m], total_generated)
+    f = lambda n, m: log_likelihood_covariance(vt_weights[n], vt_weights[m], event_weights[n], event_weights[m], total_generated, event_counts=event_counts)
     _f = lambda x: f(x, x)
     variances = jax.lax.map(_f, axis)
 
@@ -395,6 +411,56 @@ def _compute_integrated_cov(integrated_weights, sample, model_function, gw_datas
     return integrated_cov, var
     
 
+def pad_ragged_posteriors(event_posteriors):
+    """
+    Pad a list of per-event posterior dicts into a single rectangular dict.
+
+    Different events may have different numbers of posterior samples ("ragged").
+    This stacks them into ``(Nobs, NPE_max)`` arrays so the rest of the vectorized
+    machinery can run unchanged. Padded entries are made inert by setting their
+    ``'prior'`` to ``+inf`` (so the importance weight ``model/prior`` is exactly 0);
+    every other key is padded by repeating that event's first sample, which keeps the
+    population model finite on the padded rows (avoiding ``inf/inf``).
+
+    The returned ``counts`` array gives each event's real sample count and should be
+    used as the Monte-Carlo integral size (instead of ``NPE_max``) so per-event means
+    divide by the true number of samples.
+
+    Parameters
+    ----------
+    event_posteriors : list of dict
+        One dict per event, mapping parameter name to a 1-D ``(NPE_i,)`` array. Each
+        dict must contain ``'prior'``.
+
+    Returns
+    -------
+    padded : dict
+        Each key mapped to a ``(Nobs, NPE_max)`` array.
+    counts : jnp.ndarray
+        Real per-event sample counts, shape ``(Nobs,)``.
+    """
+    counts = jnp.array([jnp.asarray(event['prior']).shape[0] for event in event_posteriors])
+    npe_max = int(counts.max())
+    keys = list(event_posteriors[0].keys())
+
+    padded = {}
+    for key in keys:
+        rows = []
+        for event in event_posteriors:
+            arr = jnp.asarray(event[key])
+            pad_len = npe_max - arr.shape[0]
+            if pad_len > 0:
+                if key == 'prior':
+                    fill = jnp.full(pad_len, jnp.inf, dtype=arr.dtype)
+                else:
+                    # repeat a real, in-support sample so the model stays finite
+                    fill = jnp.full(pad_len, arr[0], dtype=arr.dtype)
+                arr = jnp.concatenate([arr, fill])
+            rows.append(arr)
+        padded[key] = jnp.stack(rows)
+
+    return padded, counts
+
 def format_hyperposterior(hyperposterior):
     if isinstance(hyperposterior, pd.DataFrame):
         hyperposterior = hyperposterior.to_dict(orient='list')
@@ -414,17 +480,18 @@ def format_hyperposterior(hyperposterior):
     return hyperposterior, n
 
 def error_statistics(
-        model_function, 
-        injections, 
-        event_posteriors, 
-        hyperposterior, 
+        model_function,
+        injections,
+        event_posteriors,
+        hyperposterior,
         vt_model_function=None,
-        include_likelihood_correction=True, 
-        conversion_function=lambda args: (args, None), 
-        nobs=None, 
+        include_likelihood_correction=True,
+        conversion_function=lambda args: (args, None),
+        nobs=None,
         verbose=True,
         rate=False,
         rate_key='rate',
+        event_counts=None,
         ):
     """
     Compute error, precision, and accuracy statistics from model, hyperposterior, and data.
@@ -435,8 +502,12 @@ def error_statistics(
         Population model with interface (dataset, parameters) -> probabilities.
     injections : dict
         Injection dataset, including 'prior' and 'total_generated' keys.
-    event_posteriors : dict
-        Event posterior samples, including 'prior' key.
+    event_posteriors : dict or list of dict
+        Event posterior samples, including 'prior' key. Either a rectangular dict with
+        ``(Nobs, NPE)`` arrays, or a *list of per-event dicts* with 1-D ``(NPE_i,)``
+        arrays (ragged: events may have different sample counts). A list is padded
+        internally via :func:`pad_ragged_posteriors` and the real per-event counts are
+        used as the Monte-Carlo integral size.
     hyperposterior : pandas.DataFrame or dict of jnp.ndarray
         If pandas.DataFrame, converts to appropriate format. Otherwise, hyperposterior 
         samples with keys as hyperparameters, and values are jnp.ndarray with first 
@@ -459,6 +530,11 @@ def error_statistics(
         Whether to treat the VT weights as rate-weighted. TESTTHIS!!!
     rate_key : string, default='rate'
         The key which to access the overall merger rate within the posterior.
+    event_counts : jnp.ndarray, optional
+        Per-event real sample counts, shape ``(Nobs,)``, used as the single-event
+        Monte-Carlo integral size. Set automatically when ``event_posteriors`` is a
+        ragged list; pass explicitly if you pre-pad a rectangular dict yourself. If
+        ``None`` and ``event_posteriors`` is rectangular, ``NPE`` is used.
 
     Returns
     -------
@@ -469,6 +545,11 @@ def error_statistics(
         - 'accuracy_statistic' : float, information loss due to bias.
     """
 
+    # Ragged input: a list of per-event dicts. Pad to a rectangular dict and use the
+    # real per-event counts as the single-event Monte-Carlo integral size.
+    if isinstance(event_posteriors, (list, tuple)):
+        event_posteriors, event_counts = pad_ragged_posteriors(event_posteriors)
+
     hyperposterior, n = format_hyperposterior(hyperposterior)
 
     if nobs is None:
@@ -476,14 +557,15 @@ def error_statistics(
         if verbose:
             print(f'Nobs not provided, assuming Nobs = {nobs}')
     total_generated = injections['total_generated']
-    
+
     mean_event_weights = _compute_mean_weights_for_correction(
-        hyperposterior, 
+        hyperposterior,
         n,
-        model_function, 
-        event_posteriors, 
-        conversion_function=conversion_function, 
-        MC_type='single event', 
+        model_function,
+        event_posteriors,
+        MC_integral_size=event_counts,
+        conversion_function=conversion_function,
+        MC_type='single event',
         verbose=verbose
         )
     if vt_model_function is None:
@@ -501,7 +583,7 @@ def error_statistics(
         rate_key=rate_key
         )
 
-    def create_loop_fn(m, p, MC_type='single event'):
+    def create_loop_fn(m, p, MC_type='single event', MC_integral_size=None):
         if MC_type=='single event':
             _rate = False
             _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
@@ -510,9 +592,10 @@ def error_statistics(
             _model_function = bilby_model_to_model_function(vt_model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
         loop_fn = lambda _, sample: (_, (sample[0],)+ _compute_integrated_cov(
                 m,
-                sample[1], 
-                _model_function, 
+                sample[1],
+                _model_function,
                 p,
+                MC_integral_size=MC_integral_size,
                 rate=_rate
                 ))
         if verbose:
@@ -521,7 +604,7 @@ def error_statistics(
             return jax.jit(loop_fn)
 
     _, (_, event_integrated_covs, event_vars) = jax.lax.scan(
-        create_loop_fn(mean_event_weights, event_posteriors),
+        create_loop_fn(mean_event_weights, event_posteriors, MC_integral_size=event_counts),
         0,
         (jnp.arange(n), hyperposterior),
         length=n
