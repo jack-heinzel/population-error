@@ -19,6 +19,7 @@ Examples
 
    examples/weights_array.ipynb
    examples/gwpopulation.ipynb
+   examples/marginal_gwpopulation.ipynb
 
 API Reference
 -------------

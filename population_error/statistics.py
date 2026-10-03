@@ -1,3 +1,5 @@
+from functools import partial
+import numpy as np
 import jax.numpy as jnp
 import jax
 import jax_tqdm
@@ -185,6 +187,29 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
             Expected information lost to both bias and uncertainty in posterior estimator.
     """
 
+    variances, weights, corrections = _covariance_terms_from_weights(
+        vt_weights, event_weights, total_generated, include_likelihood_correction=include_likelihood_correction, event_counts=event_counts
+        )
+
+    # the likelihood correction shifts the bias only, so it enters the accuracy but not the precision
+    precision = float((jnp.mean(variances) - jnp.mean(weights)) / 2 / jnp.log(2))
+    accuracy = float(jnp.var(weights - corrections) / 2 / jnp.log(2))
+    error = float(precision + accuracy)
+
+    return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
+
+def _covariance_terms_from_weights(vt_weights, event_weights, total_generated, include_likelihood_correction=True, event_counts=None):
+    """
+    Per-hyperposterior-sample covariance terms used by the error statistics.
+
+    Returns
+    -------
+    tuple of jnp.ndarray, each of shape (n_samples,)
+        - variances : Var[ln L(Lambda_n)]
+        - weights : mean over m of Cov[ln L(Lambda_n), ln L(Lambda_m)]
+        - corrections : likelihood log-correction at Lambda_n (zeros if not included)
+    """
+
     length, Nobs, NPE = event_weights.shape
     axis = jnp.arange(length)
     arr_n, arr_m = jnp.meshgrid(axis, axis, indexing='ij')
@@ -197,17 +222,222 @@ def error_statistics_from_weights(vt_weights, event_weights, total_generated, in
         _f = lambda x: f(arr_n[n,x], arr_m[n,x])
         meanw = jnp.mean(jax.lax.map(_f, axis), axis=0)
         if include_likelihood_correction:
-            meanw = likelihood_log_correction(vt_weights[n], total_generated, Nobs) - meanw
-        return carry, meanw
+            correction = likelihood_log_correction(vt_weights[n], total_generated, Nobs)
+        else:
+            correction = 0.
+        return carry, (meanw, correction)
 
-    weight_func = jax_tqdm.scan_tqdm(length, print_rate=1, tqdm_type='std')(weight_func)
-    _, weights = jax.lax.scan(weight_func, 0., xs=axis)
+    _, (weights, corrections) = jax.lax.scan(weight_func, 0., xs=axis)
+    return variances, weights, corrections
 
-    precision = float((jnp.mean(variances) - jnp.mean(weights)) / 2 / jnp.log(2))
-    accuracy = float(jnp.var(weights) / 2 / jnp.log(2))
-    error = float(precision + accuracy)
-    
-    return {'error_statistic': error, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
+def _unique_hyperposterior_samples(hyperposterior):
+    """
+    Identify repeated hyperposterior samples (e.g. from resampling a nested-sampling run).
+
+    Returns
+    -------
+    keys : list of str
+    unique_values : np.ndarray, shape (U, n_params), the distinct samples
+    representative : np.ndarray, shape (U,), index of one copy of each distinct sample
+    multiplicity : np.ndarray, shape (U,), number of copies of each distinct sample
+    """
+    keys = list(hyperposterior.keys())
+    theta = np.column_stack([np.asarray(hyperposterior[k], dtype=float) for k in keys])
+    unique_values, representative, multiplicity = np.unique(theta, axis=0, return_index=True, return_counts=True)
+    return keys, unique_values, representative, multiplicity
+
+def _sorted_window_neighbours(xs, cs, k_neighbours):
+    """
+    JAX kernel for :func:`_marginal_nearest_neighbours`, given values xs already sorted ascending
+    and their multiplicities cs. Returns (offsets, neighbour_weights), each of shape (U, 2K).
+    """
+    U = xs.shape[0]
+    window = jnp.concatenate([-jnp.arange(k_neighbours, 0, -1), jnp.arange(1, k_neighbours + 1)])
+    positions = jnp.arange(U)[:, None] + window[None, :]
+    valid = (positions >= 0) & (positions < U)
+    clipped = jnp.clip(positions, 0, U - 1)
+    distance = jnp.where(valid, jnp.abs(xs[clipped] - xs[:, None]), jnp.inf)
+
+    nearest = jnp.argsort(distance, axis=1, stable=True)
+    offsets = jnp.take_along_axis(jnp.broadcast_to(window, positions.shape), nearest, axis=1)
+    copies = jnp.where(jnp.take_along_axis(valid, nearest, axis=1), cs[jnp.take_along_axis(clipped, nearest, axis=1)], 0)
+    # greedily take copies of the nearest samples until K have been used
+    neighbour_weights = jnp.clip(k_neighbours - (jnp.cumsum(copies, axis=1) - copies), 0, copies)
+    return offsets, neighbour_weights
+
+def _marginal_nearest_neighbours(x, multiplicity, k_neighbours):
+    """
+    K nearest neighbours in one hyperparameter, over distinct hyperposterior samples.
+
+    Each distinct sample u is paired with the k_neighbours closest *other* samples in x,
+    counting repeated samples with their multiplicity but never pairing a sample with a
+    copy of itself (which would return Var rather than Cov). Since all K nearest samples
+    lie within K distinct samples on either side in sorted order, only that window is searched.
+
+    Parameters
+    ----------
+    x : np.ndarray, shape (U,)
+        Value of the hyperparameter for each distinct sample.
+    multiplicity : np.ndarray, shape (U,)
+        Number of copies of each distinct sample.
+    k_neighbours : int
+        Number of nearest neighbours, K.
+
+    Returns
+    -------
+    order : np.ndarray, shape (U,)
+        Distinct-sample index at each position of x sorted ascending.
+    offsets : np.ndarray, shape (U, 2K)
+        Neighbour position minus own position in the sorted order.
+    neighbour_weights : np.ndarray, shape (U, 2K)
+        Number of copies of each neighbour used; each row sums to K.
+    """
+    order = np.argsort(x, kind='stable')
+    offsets, neighbour_weights = _sorted_window_neighbours(jnp.asarray(x[order]), jnp.asarray(multiplicity[order]), k_neighbours)
+    offsets, neighbour_weights = np.asarray(offsets), np.asarray(neighbour_weights)
+
+    if np.any(neighbour_weights.sum(axis=1) < k_neighbours):
+        raise ValueError(f'Fewer than k_neighbours={k_neighbours} distinct hyperposterior samples available.')
+    return order, offsets, neighbour_weights
+
+def _marginal_statistics(pair_covariance, b, multiplicity, order, offsets, neighbour_weights, n, joint_mean_cov):
+    """
+    Combine nearest-neighbour pair covariances into marginal (precision, accuracy, error).
+
+    pair_covariance[p, j] is Cov[ln L] between the distinct samples at sorted positions p
+    and p + offsets[p, j]; b is the per-distinct-sample bias term (weights - correction).
+    """
+    K = neighbour_weights.sum(axis=1)[0]
+    outer = multiplicity[order][:, None] * neighbour_weights / n / K
+    b_sorted = b[order]
+    neighbour_b = b_sorted[np.clip(np.arange(len(order))[:, None] + offsets, 0, len(order) - 1)]
+    b_mean = np.sum(multiplicity * b) / n
+
+    precision = float((np.sum(outer * pair_covariance) - joint_mean_cov) / 2 / np.log(2))
+    accuracy = float(np.sum(outer * (b_sorted[:, None] - b_mean) * (neighbour_b - b_mean)) / 2 / np.log(2))
+    return {'error_statistic': precision + accuracy, 'precision_statistic': precision, 'accuracy_statistic': accuracy}
+
+def marginal_error_statistics_from_weights(
+        vt_weights,
+        event_weights,
+        total_generated,
+        hyperposterior,
+        parameters=None,
+        k_neighbours=1,
+        include_likelihood_correction=True,
+        event_counts=None,
+        verbose=True,
+        ):
+    """
+    Compute error statistics for the one-dimensional marginal hyperposteriors.
+
+    For Lambda = (Lambda', x), MC noise delta(Lambda) = ln L_hat - ln L perturbs the marginal
+    posterior p(x) through its conditional average over p(Lambda' | x). The marginal precision
+    replaces Var[delta(Lambda)] in the joint precision statistic by
+
+        E_x Var[ E_{Lambda'|x} delta ] = E Cov[delta(Lambda', x), delta(Lambda'', x)],
+
+    with Lambda', Lambda'' drawn independently from p(Lambda' | x). This is estimated by pairing
+    each hyperposterior sample with its K nearest neighbours in x: the neighbours are chosen
+    using x alone, so their Lambda' are independent draws from p(Lambda' | x ~ x_n). The
+    marginal accuracy uses the same pairing to estimate Var_x of the conditional mean bias.
+    Repeated hyperposterior samples are never paired with a copy of themselves.
+
+    Parameters
+    ----------
+    vt_weights : jnp.ndarray
+        Array of shape (n_samples, n_injections), injection weights per hyperposterior sample.
+    event_weights : jnp.ndarray
+        Array of shape (n_samples, n_obs, n_pe), event posterior weights per hyperposterior sample.
+    total_generated : int or float
+        Total number of injections.
+    hyperposterior : pandas.DataFrame or dict of array_like
+        Hyperposterior samples, in the same order as the first axis of the weights. All columns
+        are used to identify repeated samples, so include every sampled hyperparameter.
+    parameters : list of str, optional
+        Hyperparameters for which to compute marginal statistics. Defaults to all columns.
+    k_neighbours : int, default=1
+        Number of nearest neighbours in x averaged over for each sample. Larger K reduces the
+        noise of the estimate at the cost of resolution in x.
+    include_likelihood_correction : bool, default=True
+        As in :func:`error_statistics_from_weights`.
+    event_counts : jnp.ndarray, optional
+        As in :func:`error_statistics_from_weights`.
+    verbose : bool, default=True
+        Whether to print a summary table.
+
+    Returns
+    -------
+    dict
+        - 'joint' : dict of the joint (error, precision, accuracy) statistics, as returned by
+          :func:`error_statistics_from_weights`.
+        - 'marginal' : dict mapping each parameter to its dict of (error, precision, accuracy)
+          statistics. Parameters that take a single value are mapped to NaNs. The estimates
+          are noisy and can be slightly negative when the true value is ~0.
+    """
+
+    hyperposterior, n = format_hyperposterior(dict(hyperposterior) if isinstance(hyperposterior, dict) else hyperposterior)
+    keys, unique_values, representative, multiplicity = _unique_hyperposterior_samples(hyperposterior)
+    if parameters is None:
+        parameters = keys
+    if n != vt_weights.shape[0] or n != event_weights.shape[0]:
+        raise ValueError(f'hyperposterior has {n} samples but the weights have {vt_weights.shape[0]} and {event_weights.shape[0]}.')
+
+    variances, weights, corrections = _covariance_terms_from_weights(
+        vt_weights, event_weights, total_generated, include_likelihood_correction=include_likelihood_correction, event_counts=event_counts
+        )
+    variances, weights, corrections = np.asarray(variances), np.asarray(weights), np.asarray(corrections)
+    joint_mean_cov = float(np.mean(weights))
+    joint_precision = float((np.mean(variances) - joint_mean_cov) / 2 / np.log(2))
+    joint_accuracy = float(np.var(weights - corrections) / 2 / np.log(2))
+    joint = {'error_statistic': joint_precision + joint_accuracy, 'precision_statistic': joint_precision, 'accuracy_statistic': joint_accuracy}
+
+    b = (weights - corrections)[representative]
+
+    # gather the nearest-neighbour pairs for all parameters and evaluate their covariances together
+    neighbours, pairs_n, pairs_m = {}, [], []
+    for key in parameters:
+        x = unique_values[:, keys.index(key)]
+        if np.ptp(x) == 0:
+            continue
+        order, offsets, neighbour_weights = _marginal_nearest_neighbours(x, multiplicity, k_neighbours)
+        neighbour_order = order[np.clip(np.arange(len(order))[:, None] + offsets, 0, len(order) - 1)]
+        used = neighbour_weights > 0
+        neighbours[key] = (order, offsets, neighbour_weights, used)
+        pairs_n.append(representative[np.broadcast_to(order[:, None], used.shape)[used]])
+        pairs_m.append(representative[neighbour_order[used]])
+
+    if pairs_n:
+        pairs_n, pairs_m = jnp.array(np.concatenate(pairs_n)), jnp.array(np.concatenate(pairs_m))
+        pair_func = lambda nm: log_likelihood_covariance(
+            vt_weights[nm[0]], vt_weights[nm[1]], event_weights[nm[0]], event_weights[nm[1]], total_generated, event_counts=event_counts
+            )
+        pair_covariances = np.asarray(jax.lax.map(pair_func, (pairs_n, pairs_m)))
+        start = 0
+
+    marginal = {}
+    for key in parameters:
+        if key not in neighbours:
+            marginal[key] = {'error_statistic': np.nan, 'precision_statistic': np.nan, 'accuracy_statistic': np.nan}
+            continue
+        order, offsets, neighbour_weights, used = neighbours[key]
+        pair_covariance = np.zeros(used.shape)
+        pair_covariance[used] = pair_covariances[start:start + used.sum()]
+        start += used.sum()
+        marginal[key] = _marginal_statistics(pair_covariance, b, multiplicity, order, offsets, neighbour_weights, n, joint_mean_cov)
+
+    if verbose:
+        _print_marginal_statistics(joint, marginal)
+    return {'joint': joint, 'marginal': marginal}
+
+def _print_marginal_statistics(joint, marginal):
+    width = max([len(k) for k in marginal] + [len('joint')])
+    print(f"\n{'parameter':<{width}}  {'error':>10}  {'precision':>10}  {'accuracy':>10}  {'precision / joint':>17}")
+    rows = [('joint', joint)] + list(marginal.items())
+    for key, stats in rows:
+        ratio = stats['precision_statistic'] / joint['precision_statistic'] if joint['precision_statistic'] != 0 else np.nan
+        print(f"{key:<{width}}  {stats['error_statistic']:>10.4g}  {stats['precision_statistic']:>10.4g}  {stats['accuracy_statistic']:>10.4g}  {ratio:>17.3f}")
+    print('(statistics in bits)')
 
 def bilby_model_to_model_function(bilby_model, conversion_function=lambda args: (args, None), rate=False, rate_key='rate'):
     """
@@ -479,6 +709,99 @@ def format_hyperposterior(hyperposterior):
     n = ns[0]
     return hyperposterior, n
 
+def _prepare_error_statistics_inputs(event_posteriors, hyperposterior, nobs, event_counts, verbose):
+    """
+    Pad ragged event posteriors, format the hyperposterior, and infer Nobs if needed.
+    """
+
+    # Ragged input: a list of per-event dicts. Pad to a rectangular dict and use the
+    # real per-event counts as the single-event Monte-Carlo integral size.
+    if isinstance(event_posteriors, (list, tuple)):
+        event_posteriors, event_counts = pad_ragged_posteriors(event_posteriors)
+
+    hyperposterior, n = format_hyperposterior(hyperposterior)
+
+    if nobs is None:
+        nobs = event_posteriors['prior'].shape[0]
+        if verbose:
+            print(f'Nobs not provided, assuming Nobs = {nobs}')
+    return event_posteriors, event_counts, hyperposterior, n, nobs
+
+def _integrated_covariances(
+        model_function, vt_model_function, injections, event_posteriors, hyperposterior, n,
+        conversion_function, verbose, rate, rate_key, event_counts,
+        ):
+    """
+    For each hyperposterior sample Lambda_n, compute the single-event and selection log-variances
+    and their covariances averaged over all other hyperposterior samples, without storing the
+    weights for every sample.
+
+    Returns
+    -------
+    tuple of jnp.ndarray
+        (event_integrated_covs, event_vars) of shape (n, Nobs) and (vt_integrated_covs, vt_vars) of shape (n,).
+    """
+
+    total_generated = injections['total_generated']
+
+    mean_event_weights = _compute_mean_weights_for_correction(
+        hyperposterior,
+        n,
+        model_function,
+        event_posteriors,
+        MC_integral_size=event_counts,
+        conversion_function=conversion_function,
+        MC_type='single event',
+        verbose=verbose
+        )
+    mean_vt_weights = _compute_mean_weights_for_correction(
+        hyperposterior, 
+        n,
+        vt_model_function, 
+        injections, 
+        MC_integral_size=total_generated, 
+        conversion_function=conversion_function, 
+        MC_type='selection', 
+        verbose=verbose,
+        rate=rate,
+        rate_key=rate_key
+        )
+
+    def create_loop_fn(m, p, MC_type='single event', MC_integral_size=None):
+        if MC_type=='single event':
+            _rate = False
+            _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
+        else:
+            _rate = rate
+            _model_function = bilby_model_to_model_function(vt_model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
+        loop_fn = lambda _, sample: (_, (sample[0],)+ _compute_integrated_cov(
+                m,
+                sample[1],
+                _model_function,
+                p,
+                MC_integral_size=MC_integral_size,
+                rate=_rate
+                ))
+        if verbose:
+            return jax_tqdm.scan_tqdm(n, print_rate=1, tqdm_type='std', desc=f'For each posterior sample, average {MC_type} covariance with another posterior sample')(loop_fn)
+        else:
+            return jax.jit(loop_fn)
+
+    _, (_, event_integrated_covs, event_vars) = jax.lax.scan(
+        create_loop_fn(mean_event_weights, event_posteriors, MC_integral_size=event_counts),
+        0,
+        (jnp.arange(n), hyperposterior),
+        length=n
+    )
+    
+    _, (_, vt_integrated_covs, vt_vars) = jax.lax.scan(
+        create_loop_fn(mean_vt_weights, injections, MC_type='selection'),
+        0,
+        (jnp.arange(n), hyperposterior),
+        length=n
+    )
+    return event_integrated_covs, event_vars, vt_integrated_covs, vt_vars
+
 def error_statistics(
         model_function,
         injections,
@@ -545,77 +868,16 @@ def error_statistics(
         - 'accuracy_statistic' : float, information loss due to bias.
     """
 
-    # Ragged input: a list of per-event dicts. Pad to a rectangular dict and use the
-    # real per-event counts as the single-event Monte-Carlo integral size.
-    if isinstance(event_posteriors, (list, tuple)):
-        event_posteriors, event_counts = pad_ragged_posteriors(event_posteriors)
-
-    hyperposterior, n = format_hyperposterior(hyperposterior)
-
-    if nobs is None:
-        nobs = event_posteriors['prior'].shape[0]
-        if verbose:
-            print(f'Nobs not provided, assuming Nobs = {nobs}')
-    total_generated = injections['total_generated']
-
-    mean_event_weights = _compute_mean_weights_for_correction(
-        hyperposterior,
-        n,
-        model_function,
-        event_posteriors,
-        MC_integral_size=event_counts,
-        conversion_function=conversion_function,
-        MC_type='single event',
-        verbose=verbose
+    event_posteriors, event_counts, hyperposterior, n, nobs = _prepare_error_statistics_inputs(
+        event_posteriors, hyperposterior, nobs, event_counts, verbose
         )
     if vt_model_function is None:
         vt_model_function = model_function
-    mean_vt_weights = _compute_mean_weights_for_correction(
-        hyperposterior, 
-        n,
-        vt_model_function, 
-        injections, 
-        MC_integral_size=total_generated, 
-        conversion_function=conversion_function, 
-        MC_type='selection', 
-        verbose=verbose,
-        rate=rate,
-        rate_key=rate_key
+
+    event_integrated_covs, event_vars, vt_integrated_covs, vt_vars = _integrated_covariances(
+        model_function, vt_model_function, injections, event_posteriors, hyperposterior, n,
+        conversion_function, verbose, rate, rate_key, event_counts,
         )
-
-    def create_loop_fn(m, p, MC_type='single event', MC_integral_size=None):
-        if MC_type=='single event':
-            _rate = False
-            _model_function = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
-        else:
-            _rate = rate
-            _model_function = bilby_model_to_model_function(vt_model_function, conversion_function=conversion_function, rate=_rate, rate_key=rate_key)
-        loop_fn = lambda _, sample: (_, (sample[0],)+ _compute_integrated_cov(
-                m,
-                sample[1],
-                _model_function,
-                p,
-                MC_integral_size=MC_integral_size,
-                rate=_rate
-                ))
-        if verbose:
-            return jax_tqdm.scan_tqdm(n, print_rate=1, tqdm_type='std', desc=f'For each posterior sample, average {MC_type} covariance with another posterior sample')(loop_fn)
-        else:
-            return jax.jit(loop_fn)
-
-    _, (_, event_integrated_covs, event_vars) = jax.lax.scan(
-        create_loop_fn(mean_event_weights, event_posteriors, MC_integral_size=event_counts),
-        0,
-        (jnp.arange(n), hyperposterior),
-        length=n
-    )
-    
-    _, (_, vt_integrated_covs, vt_vars) = jax.lax.scan(
-        create_loop_fn(mean_vt_weights, injections, MC_type='selection'),
-        0,
-        (jnp.arange(n), hyperposterior),
-        length=n
-    )
 
     if rate:
         nobs = 1
@@ -668,3 +930,498 @@ def error_statistics(
         'selection_accuracy_statistic': selection_accuracy,
         'correlation_event_selection_accuracy_statistic': correlation_accuracy,
         }
+
+def marginal_error_statistics(
+        model_function,
+        injections,
+        event_posteriors,
+        hyperposterior,
+        parameters=None,
+        k_neighbours=1,
+        vt_model_function=None,
+        include_likelihood_correction=True,
+        conversion_function=lambda args: (args, None),
+        nobs=None,
+        verbose=True,
+        rate=False,
+        rate_key='rate',
+        event_counts=None,
+        ):
+    """
+    Compute error statistics for the one-dimensional marginal hyperposteriors, without storing
+    weights for every hyperposterior sample.
+
+    This is the memory-efficient analogue of :func:`marginal_error_statistics_from_weights`; see
+    there for the method. For each parameter, the distinct hyperposterior samples are visited in
+    order of that parameter while keeping the normalized weights of the previous K samples, so
+    every nearest-neighbour covariance is available with one model evaluation per sample. The
+    cost is therefore ~(2 + n_parameters) model evaluations per hyperposterior sample, and the
+    memory is ~K times that of a single sample's weights.
+
+    Parameters
+    ----------
+    model_function, injections, event_posteriors, hyperposterior, vt_model_function,
+    include_likelihood_correction, conversion_function, nobs, verbose, rate, rate_key, event_counts
+        As in :func:`error_statistics`. All hyperposterior columns are used to identify repeated
+        samples, so include every sampled hyperparameter.
+    parameters : list of str, optional
+        Hyperparameters for which to compute marginal statistics. Defaults to all columns.
+    k_neighbours : int, default=1
+        Number of nearest neighbours in x averaged over for each sample. Larger K reduces the
+        noise of the estimate at the cost of resolution in x.
+
+    Returns
+    -------
+    dict
+        - 'joint' : dict of the joint (error, precision, accuracy) statistics.
+        - 'marginal' : dict mapping each parameter to its dict of (error, precision, accuracy)
+          statistics. Parameters that take a single value are mapped to NaNs. The estimates
+          are noisy and can be slightly negative when the true value is ~0.
+    """
+
+    event_posteriors, event_counts, hyperposterior, n, nobs = _prepare_error_statistics_inputs(
+        event_posteriors, hyperposterior, nobs, event_counts, verbose
+        )
+    if vt_model_function is None:
+        vt_model_function = model_function
+    keys, unique_values, representative, multiplicity = _unique_hyperposterior_samples(hyperposterior)
+    if parameters is None:
+        parameters = keys
+
+    event_integrated_covs, event_vars, vt_integrated_covs, vt_vars = _integrated_covariances(
+        model_function, vt_model_function, injections, event_posteriors, hyperposterior, n,
+        conversion_function, verbose, rate, rate_key, event_counts,
+        )
+
+    if rate:
+        nobs = 1
+    var = np.asarray(jnp.sum(event_vars, axis=-1) + nobs**2 * vt_vars)
+    cov = np.asarray(jnp.sum(event_integrated_covs, axis=-1) + nobs**2 * vt_integrated_covs)
+    if not include_likelihood_correction:
+        correction = np.zeros(n)
+    elif rate:
+        correction = np.asarray(vt_vars) / 2
+    else:
+        correction = nobs * (nobs + 1) * np.asarray(vt_vars) / 2
+
+    joint_mean_cov = float(np.mean(cov))
+    joint_precision = float((np.mean(var) - joint_mean_cov) / 2 / np.log(2))
+    joint_accuracy = float(np.var(cov - correction) / 2 / np.log(2))
+    joint = {'error_statistic': joint_precision + joint_accuracy, 'precision_statistic': joint_precision, 'accuracy_statistic': joint_accuracy}
+
+    b = (cov - correction)[representative]
+
+    event_data = dict(event_posteriors)
+    event_prior = event_data.pop('prior')
+    event_size = event_prior.shape[-1] if event_counts is None else event_counts
+    vt_data = dict(injections)
+    vt_prior = vt_data.pop('prior')
+    vt_size = vt_data.pop('total_generated', vt_prior.shape[-1])
+    def normalized_weights(model, data, prior, size, sample, _rate):
+        weights = model(data, dict(sample)) / prior
+        if _rate:
+            return weights
+        return weights / (jnp.sum(weights, axis=-1) / size)[..., None]
+
+    def create_loop_fn():
+        # bilby models hold their parameters as state, so build fresh ones for every scan to avoid leaking tracers
+        event_model = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=False, rate_key=rate_key)
+        vt_model = bilby_model_to_model_function(vt_model_function, conversion_function=conversion_function, rate=rate, rate_key=rate_key)
+
+        def neighbour_covariances(buffers, xs):
+            # covariance of ln L between this sample and each of the previous K samples in sorted order
+            event_buffer, vt_buffer = buffers
+            _, sample = xs
+            event_w = normalized_weights(event_model, event_data, event_prior, event_size, sample, False)
+            vt_w = normalized_weights(vt_model, vt_data, vt_prior, vt_size, sample, rate)
+            event_cov = (jnp.sum(event_buffer * event_w, axis=-1) / event_size - 1) / (event_size - 1)
+            vt_cov = (jnp.sum(vt_buffer * vt_w, axis=-1) / vt_size - 1) / (vt_size - 1)
+            buffers = (
+                jnp.concatenate([event_w[None], event_buffer[:-1]]),
+                jnp.concatenate([vt_w[None], vt_buffer[:-1]]),
+                )
+            return buffers, jnp.sum(event_cov, axis=-1) + nobs**2 * vt_cov
+        return neighbour_covariances
+
+    marginal = {}
+    for key in parameters:
+        x = unique_values[:, keys.index(key)]
+        if np.ptp(x) == 0:
+            marginal[key] = {'error_statistic': np.nan, 'precision_statistic': np.nan, 'accuracy_statistic': np.nan}
+            continue
+        order, offsets, neighbour_weights = _marginal_nearest_neighbours(x, multiplicity, k_neighbours)
+        U = len(order)
+        sorted_samples = {k: hyperposterior[k][representative[order]] for k in keys}
+
+        if verbose:
+            loop_fn = jax_tqdm.scan_tqdm(U, print_rate=1, tqdm_type='std', desc=f'Nearest-neighbour covariances in {key}')(create_loop_fn())
+        else:
+            loop_fn = jax.jit(create_loop_fn())
+        buffers = (jnp.zeros((k_neighbours,) + event_prior.shape), jnp.zeros((k_neighbours,) + vt_prior.shape))
+        _, previous_covariances = jax.lax.scan(loop_fn, buffers, (jnp.arange(U), sorted_samples), length=U)
+        previous_covariances = np.asarray(previous_covariances) # [p, j] = Cov between positions p and p - 1 - j
+
+        positions = np.arange(U)[:, None]
+        later = offsets > 0
+        rows = np.clip(np.where(later, positions + offsets, positions), 0, U - 1)
+        cols = np.clip(np.abs(offsets) - 1, 0, k_neighbours - 1)
+        pair_covariance = np.where(neighbour_weights > 0, previous_covariances[rows, cols], 0.)
+
+        marginal[key] = _marginal_statistics(pair_covariance, b, multiplicity, order, offsets, neighbour_weights, n, joint_mean_cov)
+
+    if verbose:
+        _print_marginal_statistics(joint, marginal)
+    return {'joint': joint, 'marginal': marginal}
+
+def _distinct_samples_by_projection(hyperposterior_np, keys, seed=12345):
+    """
+    Identify repeated hyperposterior samples from a random linear projection of each row,
+    which avoids forming the (n, n_params) array when there are very many hyperparameters.
+    Identical rows have identical projections; distinct rows collide with negligible probability.
+
+    Returns
+    -------
+    representative, multiplicity : np.ndarray, shape (U,)
+        Index of one copy of each distinct sample, and its number of copies.
+    """
+    rng = np.random.default_rng(seed)
+    projection = 0.
+    for key in keys:
+        projection = projection + np.asarray(hyperposterior_np[key], dtype=float) * rng.normal()
+    _, representative, multiplicity = np.unique(projection, return_index=True, return_counts=True)
+    return representative, multiplicity
+
+def _log_likelihood_covariance_matrix(
+        model_function, vt_model_function, injections, event_posteriors, hyperposterior, representative, multiplicity, n,
+        conversion_function, nobs, rate, rate_key, event_counts, block_size, sketch_size, seed, verbose,
+        ):
+    """
+    Covariance of ln L between all pairs of distinct hyperposterior samples, centred on the
+    hyperposterior mean.
+
+    Cov[ln L(Lambda_n), ln L(Lambda_m)] = <v_n, v_m> - c_0 is an inner product of per-sample
+    feature vectors v_n (the normalized single-event and selection weights, scaled by
+    1/sqrt(M (M-1))). With vbar the hyperposterior mean of v_n, this returns
+
+        G[n, m] = <v_n - vbar, v_m - vbar>,    a[n] = <v_n - vbar, vbar>,
+
+    from which Cov[n, m] = G[n, m] + a[n] + a[m] + const. Every error statistic only needs
+    differences of covariances, so the constant (and the cancellation against c_0) never appears.
+
+    The features have length Nobs * NPE + Ninj and are never stored for every sample. Exactly,
+    G is built in blocks of block_size samples, costing ~U + U^2 / (2 block_size) model
+    evaluations. With sketch_size, each feature vector is compressed by a CountSketch into
+    sketch_size dimensions in a single pass (~2U evaluations), giving an unbiased estimate of the
+    off-diagonal of G with relative error ~1/sqrt(sketch_size); the diagonal is always exact.
+
+    Returns
+    -------
+    G : np.ndarray, shape (U, U)
+    a : np.ndarray, shape (U,)
+    vt_vars : np.ndarray, shape (U,), Var[ln of the selection MC integral], for the likelihood correction
+    """
+    from tqdm import tqdm
+
+    event_data = dict(event_posteriors)
+    event_prior = jnp.asarray(event_data.pop('prior'))
+    Nobs = event_prior.shape[0]
+    event_size = jnp.broadcast_to(jnp.asarray(event_prior.shape[-1] if event_counts is None else event_counts, dtype=event_prior.dtype), (Nobs,))
+    vt_data = dict(injections)
+    vt_prior = jnp.asarray(vt_data.pop('prior'))
+    vt_size = vt_data.pop('total_generated', vt_prior.shape[-1])
+    event_scale = 1 / jnp.sqrt(event_size * (event_size - 1))
+    vt_scale = nobs / jnp.sqrt(vt_size * (vt_size - 1.))
+
+    U = len(representative)
+    if block_size is None:
+        # aim for ~0.5GB of features per block
+        block_size = max(1, int(5e8 // ((event_prior.size + vt_prior.size) * event_prior.dtype.itemsize)))
+    block_size = min(block_size, U)
+    blocks = [np.arange(start, min(start + block_size, U)) for start in range(0, U, block_size)]
+
+    def create_sample_weights():
+        # bilby models hold their parameters as state, so build fresh ones for every traced function
+        event_model = bilby_model_to_model_function(model_function, conversion_function=conversion_function, rate=False, rate_key=rate_key)
+        vt_model = bilby_model_to_model_function(vt_model_function, conversion_function=conversion_function, rate=rate, rate_key=rate_key)
+
+        def sample_weights(sample):
+            event_w = event_model(event_data, dict(sample)) / event_prior
+            event_w = event_w / (jnp.sum(event_w, axis=-1) / event_size)[..., None]
+            vt_w = vt_model(vt_data, dict(sample)) / vt_prior
+            if not rate:
+                vt_w = vt_w / (jnp.sum(vt_w) / vt_size)
+            vt_var = (jnp.sum(vt_w**2) / vt_size - 1) / (vt_size - 1)
+            return event_w, vt_w, vt_var
+        return sample_weights
+
+    def block_inputs(block):
+        # pad the last block to block_size so each function is only traced once; padding has zero multiplicity
+        index = np.concatenate([block, np.full(block_size - len(block), block[-1])])
+        copies = np.concatenate([multiplicity[block], np.zeros(block_size - len(block))])
+        return {k: v[representative[index]] for k, v in hyperposterior.items()}, jnp.asarray(copies, dtype=event_prior.dtype)
+
+    # first pass: hyperposterior mean of the normalized weights
+    sample_weights = create_sample_weights()
+    def accumulate(sums, xs):
+        sample, copies = xs
+        event_w, vt_w, vt_var = sample_weights(sample)
+        return (sums[0] + copies * event_w, sums[1] + copies * vt_w), vt_var
+    mean_fn = jax.jit(lambda samples, copies: jax.lax.scan(accumulate, (jnp.zeros_like(event_prior), jnp.zeros_like(vt_prior)), (samples, copies)))
+
+    event_mean, vt_mean, vt_vars = 0., 0., np.zeros(U)
+    for block in tqdm(blocks, desc='Hyperposterior mean of the weights', disable=not verbose):
+        (event_sum, vt_sum), vt_var = mean_fn(*block_inputs(block))
+        event_mean, vt_mean = event_mean + event_sum / n, vt_mean + vt_sum / n
+        vt_vars[block] = np.asarray(vt_var)[:len(block)]
+    mean_features = jnp.concatenate([(event_mean * event_scale[:, None]).ravel(), vt_scale * vt_mean])
+
+    def create_sample_features():
+        sample_weights = create_sample_weights()
+        def sample_features(sample):
+            event_w, vt_w, _ = sample_weights(sample)
+            return jnp.concatenate([((event_w - event_mean) * event_scale[:, None]).ravel(), vt_scale * (vt_w - vt_mean)])
+        return sample_features
+
+    G = np.zeros((U, U))
+    a = np.zeros(U)
+    if sketch_size is None:
+        sample_features = create_sample_features()
+        features_fn = jax.jit(lambda samples: jax.lax.map(sample_features, samples))
+        gram = jax.jit(lambda f1, f2: jax.lax.dot_general(f1, f2, (((1,), (1,)), ((), ()))))
+        n_evaluations = len(blocks) * (len(blocks) + 1) // 2
+        with tqdm(total=n_evaluations, desc='Covariance matrix blocks', disable=not verbose) as progress:
+            for i, block_i in enumerate(blocks):
+                features_i = features_fn(block_inputs(block_i)[0])
+                a[block_i] = np.asarray(features_i @ mean_features)[:len(block_i)]
+                G[np.ix_(block_i, block_i)] = np.asarray(gram(features_i, features_i))[:len(block_i), :len(block_i)]
+                progress.update()
+                for block_j in blocks[i + 1:]:
+                    G_ij = np.asarray(gram(features_i, features_fn(block_inputs(block_j)[0])))[:len(block_i), :len(block_j)]
+                    G[np.ix_(block_i, block_j)] = G_ij
+                    G[np.ix_(block_j, block_i)] = G_ij.T
+                    progress.update()
+                del features_i
+    else:
+        rng = np.random.default_rng(seed)
+        L = mean_features.shape[0]
+        buckets = jnp.asarray(rng.integers(0, sketch_size, L))
+        signs = jnp.asarray(rng.choice([-1., 1.], L), dtype=mean_features.dtype)
+        sample_features = create_sample_features()
+        def sample_sketch(sample):
+            features = sample_features(sample)
+            return jax.ops.segment_sum(features * signs, buckets, num_segments=sketch_size), features @ mean_features, features @ features
+        sketch_fn = jax.jit(lambda samples: jax.lax.map(sample_sketch, samples))
+
+        sketches, norms = jnp.zeros((U, sketch_size), dtype=mean_features.dtype), np.zeros(U)
+        for block in tqdm(blocks, desc='Sketching covariance features', disable=not verbose):
+            block_sketch, block_a, block_norms = sketch_fn(block_inputs(block)[0])
+            sketches = sketches.at[block].set(block_sketch[:len(block)])
+            a[block] = np.asarray(block_a)[:len(block)]
+            norms[block] = np.asarray(block_norms)[:len(block)]
+        G = np.array(jax.lax.dot_general(sketches, sketches, (((1,), (1,)), ((), ()))))
+        G[np.diag_indices(U)] = norms
+    return G, a, vt_vars
+
+@partial(jax.jit, static_argnums=(6,))
+def _nearest_neighbour_marginals(x, G, a, bias, multiplicity, n, k_neighbours):
+    """
+    Marginal (precision, accuracy) statistics for a batch of hyperparameters x, shape (batch, U),
+    from the centred covariance matrix G, the offsets a and the centred bias of each distinct
+    sample (see :func:`_log_likelihood_covariance_matrix`). The arrays are arguments rather than
+    closed over so that they are not compiled into the function as constants.
+    """
+    U = G.shape[0]
+
+    def single(x):
+        order = jnp.argsort(x, stable=True)
+        offsets, weights = _sorted_window_neighbours(x[order], multiplicity[order], k_neighbours)
+        partners = order[jnp.clip(jnp.arange(U)[:, None] + offsets, 0, U - 1)]
+        outer = multiplicity[order][:, None] * weights / n / k_neighbours
+        precision = jnp.sum(outer * (G[order[:, None], partners] + a[partners]))
+        accuracy = jnp.sum(outer * bias[order][:, None] * bias[partners])
+        return precision / 2 / jnp.log(2), accuracy / 2 / jnp.log(2)
+
+    return jax.vmap(single)(x)
+
+def marginal_error_statistics_matrix(
+        model_function,
+        injections,
+        event_posteriors,
+        hyperposterior,
+        parameters=None,
+        k_neighbours=1,
+        vt_model_function=None,
+        include_likelihood_correction=True,
+        conversion_function=lambda args: (args, None),
+        nobs=None,
+        verbose=True,
+        rate=False,
+        rate_key='rate',
+        event_counts=None,
+        block_size=None,
+        sketch_size=None,
+        dimension_batch_size=128,
+        null_replicates=100,
+        seed=0,
+        covariance=None,
+        return_covariance=False,
+        ):
+    """
+    Compute error statistics for the one-dimensional marginal hyperposteriors of many
+    hyperparameters at once.
+
+    The estimator is the same as :func:`marginal_error_statistics` (see
+    :func:`marginal_error_statistics_from_weights` for the method), but the model evaluations are
+    shared between all hyperparameters: the covariance of ln L between every pair of distinct
+    hyperposterior samples is computed once as a (U, U) matrix, after which each marginal only
+    needs a sort and a gather of n * K matrix entries. The marginals are computed in batches of
+    hyperparameters on the device, so this scales to very many hyperparameters. The matrix needs
+    U^2 floats of memory (~1GB in float64 for U ~ 10^4 distinct samples).
+
+    Also returns a null distribution for the marginal statistics, from applying the same estimator
+    to random, independent hyperparameters. This is the distribution of the estimate for a
+    hyperparameter that the Monte Carlo noise does not depend on (true marginal statistics of 0),
+    so its spread is the noise floor: with many hyperparameters, only marginals well above it are
+    meaningful.
+
+    Parameters
+    ----------
+    model_function, injections, event_posteriors, hyperposterior, vt_model_function,
+    include_likelihood_correction, conversion_function, nobs, verbose, rate, rate_key, event_counts
+        As in :func:`error_statistics`. All hyperposterior columns are used to identify repeated
+        samples, so include every sampled hyperparameter.
+    parameters : list of str, optional
+        Hyperparameters for which to compute marginal statistics. Defaults to all columns.
+    k_neighbours : int, default=1
+        Number of nearest neighbours in x averaged over for each sample.
+    block_size : int, optional
+        Number of hyperposterior samples whose weights are held in memory at once when building the
+        exact covariance matrix. The matrix costs ~U + U^2 / (2 block_size) model evaluations.
+        Defaults to ~0.5GB of weights. With sketch_size, only sets how many samples are processed per call.
+    sketch_size : int, optional
+        If given, approximate the covariance matrix with a CountSketch of this many dimensions,
+        which costs ~2U model evaluations. The off-diagonal entries then have relative error
+        ~1/sqrt(sketch_size). Use when U is too large for the exact matrix.
+    dimension_batch_size : int, default=128
+        Number of hyperparameters whose marginals are computed together on the device. Memory
+        is ~dimension_batch_size * U * 2K floats.
+    null_replicates : int, default=100
+        Number of random hyperparameters drawn for the null distribution. 0 disables it.
+    seed : int, default=0
+        Seed for the sketch and the null distribution.
+    covariance : dict, optional
+        The 'covariance' entry of a previous call with return_covariance=True, for the same
+        hyperposterior and inputs. Skips all model evaluations, e.g. to compute marginals for
+        another set of parameters or another k_neighbours.
+    return_covariance : bool, default=False
+        Whether to include the covariance matrix and related arrays in the output.
+
+    Returns
+    -------
+    dict
+        - 'joint' : dict of the joint (error, precision, accuracy) statistics.
+        - 'marginal' : pandas.DataFrame indexed by parameter, with columns 'error_statistic',
+          'precision_statistic' and 'accuracy_statistic', and, if the null distribution is computed,
+          'precision_significance': the number of null standard deviations by which the precision
+          statistic exceeds the null mean. Parameters that take a single value are NaN. Estimates
+          are noisy and can be slightly negative when the true value is ~0.
+        - 'null' : dict with the mean and standard deviation of the precision and accuracy
+          statistics of random hyperparameters ('precision_mean', 'precision_std', 'accuracy_mean',
+          'accuracy_std'), and the replicates themselves ('precision', 'accuracy').
+        - 'covariance' : only if return_covariance=True.
+    """
+
+    # keep the samples on the host as numpy columns; with very many hyperparameters, converting
+    # through Python lists or holding every column on the device is the bottleneck
+    if isinstance(hyperposterior, pd.DataFrame):
+        hyperposterior_np = {k: hyperposterior[k].to_numpy() for k in hyperposterior.columns}
+    else:
+        hyperposterior_np = {k: np.asarray(v) for k, v in hyperposterior.items()}
+    keys = list(hyperposterior_np.keys())
+    if parameters is None:
+        parameters = keys
+
+    if covariance is None:
+        event_posteriors, event_counts, hyperposterior, n, nobs = _prepare_error_statistics_inputs(
+            event_posteriors, dict(hyperposterior_np), nobs, event_counts, verbose
+            )
+        if vt_model_function is None:
+            vt_model_function = model_function
+        representative, multiplicity = _distinct_samples_by_projection(hyperposterior_np, keys)
+        if rate:
+            nobs = 1
+        G, a, vt_vars = _log_likelihood_covariance_matrix(
+            model_function, vt_model_function, injections, event_posteriors, hyperposterior, representative, multiplicity, n,
+            conversion_function, nobs, rate, rate_key, event_counts, block_size, sketch_size, seed, verbose,
+            )
+        if not include_likelihood_correction:
+            correction = np.zeros_like(vt_vars)
+        elif rate:
+            correction = vt_vars / 2
+        else:
+            correction = nobs * (nobs + 1) * vt_vars / 2
+        covariance = {'G': G, 'a': a, 'correction': correction, 'representative': representative, 'multiplicity': multiplicity, 'n': n}
+    G, a, correction = covariance['G'], covariance['a'], covariance['correction']
+    representative, multiplicity, n = covariance['representative'], covariance['multiplicity'], covariance['n']
+    U = len(representative)
+    if n - multiplicity.max() < k_neighbours:
+        raise ValueError(f'Fewer than k_neighbours={k_neighbours} distinct hyperposterior samples available.')
+
+    # per-sample bias, centred on its hyperposterior mean; a has hyperposterior mean 0
+    bias = a - correction
+    bias = bias - np.sum(multiplicity * bias) / n
+    joint_precision = float(np.sum(multiplicity * np.diag(G)) / n / 2 / np.log(2))
+    joint_accuracy = float(np.sum(multiplicity * bias**2) / n / 2 / np.log(2))
+    joint = {'error_statistic': joint_precision + joint_accuracy, 'precision_statistic': joint_precision, 'accuracy_statistic': joint_accuracy}
+
+    arrays = (jnp.asarray(G), jnp.asarray(a), jnp.asarray(bias), jnp.asarray(multiplicity), n)
+    batch_statistics = lambda x: _nearest_neighbour_marginals(x, *arrays, k_neighbours)
+
+    precision = np.full(len(parameters), np.nan)
+    accuracy = np.full(len(parameters), np.nan)
+    from tqdm import tqdm
+    for start in tqdm(range(0, len(parameters), dimension_batch_size), desc='Marginal statistics', disable=not verbose):
+        batch = parameters[start:start + dimension_batch_size]
+        x = np.stack([hyperposterior_np[k][representative] for k in batch])
+        # pad to a fixed batch size so the function is only traced once
+        x = np.concatenate([x, np.repeat(x[-1:], dimension_batch_size - len(batch), axis=0)])
+        batch_precision, batch_accuracy = batch_statistics(jnp.asarray(x))
+        precision[start:start + len(batch)] = np.asarray(batch_precision)[:len(batch)]
+        accuracy[start:start + len(batch)] = np.asarray(batch_accuracy)[:len(batch)]
+    constant = np.array([np.ptp(hyperposterior_np[k]) == 0 for k in parameters])
+    precision[constant], accuracy[constant] = np.nan, np.nan
+    marginal = pd.DataFrame(
+        {'error_statistic': precision + accuracy, 'precision_statistic': precision, 'accuracy_statistic': accuracy},
+        index=pd.Index(parameters, name='parameter'),
+        )
+
+    null = {}
+    if null_replicates > 0:
+        # the same estimator applied to random hyperparameters, which the MC noise cannot depend on
+        null_precision, null_accuracy = [], []
+        for key in jax.random.split(jax.random.PRNGKey(seed), -(-null_replicates // dimension_batch_size)):
+            batch_precision, batch_accuracy = batch_statistics(jax.random.uniform(key, (dimension_batch_size, U)))
+            null_precision.append(np.asarray(batch_precision))
+            null_accuracy.append(np.asarray(batch_accuracy))
+        null_precision = np.concatenate(null_precision)[:null_replicates]
+        null_accuracy = np.concatenate(null_accuracy)[:null_replicates]
+        null = {
+            'precision_mean': float(np.mean(null_precision)), 'precision_std': float(np.std(null_precision)),
+            'accuracy_mean': float(np.mean(null_accuracy)), 'accuracy_std': float(np.std(null_accuracy)),
+            'precision': null_precision, 'accuracy': null_accuracy,
+            }
+        marginal['precision_significance'] = (marginal['precision_statistic'] - null['precision_mean']) / null['precision_std']
+
+    if verbose:
+        shown = marginal.sort_values('precision_statistic', ascending=False)
+        if len(shown) > 20:
+            print(f'\nShowing the 20 of {len(shown)} marginals with the largest precision statistic.')
+            shown = shown.iloc[:20]
+        _print_marginal_statistics(joint, shown[['error_statistic', 'precision_statistic', 'accuracy_statistic']].to_dict(orient='index'))
+        if null:
+            print(f"Null (random hyperparameter) precision statistic: {null['precision_mean']:.3g} ± {null['precision_std']:.3g} bits")
+
+    result = {'joint': joint, 'marginal': marginal, 'null': null}
+    if return_covariance:
+        result['covariance'] = covariance
+    return result
